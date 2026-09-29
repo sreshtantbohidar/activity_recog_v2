@@ -24,24 +24,7 @@ venv/
 # --- local run artefacts ---
 payload_*.json
 *.log
-*.bak
-*.bak-*
-*.bak_*
-*.corrupt_bak
 *~
-
-# --- legacy scratch files kept on disk, not part of the service ---
-app_old.py
-flask_gpu_api_v1.py
-flask_gpu_api_v2.py
-flask_gpu_api_v3.py
-metrics_dump.json
-out.txt
-package.json
-package-lock.json
-huggingface/
-output/
-tmp/
 
 # --- os / editors ---
 desktop.ini
