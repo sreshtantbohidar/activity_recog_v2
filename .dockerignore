@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.git/
+logs/
+tmp/
+huggingface/
+data/
+out.txt
+id_ed25519*
+*.bak*
+secrets/

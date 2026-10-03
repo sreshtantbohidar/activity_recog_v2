@@ -1,0 +1,751 @@
+"""Single-container activity recognition: Qwen3-VL-8B via vLLM (vision),
+Qwen2-Audio-7B (audio) and YOLO (objects). Vision and audio never run together.
+"""
+from __future__ import annotations
+
+import base64, gc, json, logging, os, tempfile, threading, time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import numpy as np
+import requests
+import torch
+from decord import VideoReader, cpu
+from flask import Flask, g, jsonify, render_template, request, send_from_directory
+from flask_cors import CORS
+from flasgger import Swagger, swag_from
+from PIL import Image, UnidentifiedImageError
+from werkzeug.exceptions import HTTPException
+
+from audio_analysis import (AUDIO_STAGE_LOCK, QWEN_AUDIO_MODEL_ID, analyze_video_audio,
+    cadence_activity_bias, release_qwen_audio, sound_event_cadence_bias)
+from engine_power import EnginePowerManager
+from pdf_report import create_video_analysis_pdf
+from media_utils import ACTIVITY_LABELS, ACTIVITY_PROMPT as PROMPT
+from media_utils import CONFIDENCE_LEVELS, MediaProbeError, VideoTooLongError, analyze_motion_burstiness, build_multimodal_summary_prompt, build_video_activity_prompt, compute_frame_change_scores, confidence_label, motion_activity_bias, normalize_activity_result, normalize_confidence, parse_json_text, validate_video_duration
+from swagger_docs import (ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC, ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC,
+    ANALYZE_VIDEO_DETAILED_SWAGGER_DOC,
+    DOWNLOAD_REPORT_SWAGGER_DOC,
+    GET_CONFIG_SWAGGER_DOC, SET_CONFIG_SWAGGER_DOC,
+    DETECT_OBJECTS_SWAGGER_DOC, FETCH_MEDIA_SWAGGER_DOC, GET_VISION_BACKEND_SWAGGER_DOC,
+    HEALTH_SWAGGER_DOC, SET_VISION_BACKEND_SWAGGER_DOC)
+from response_schema import (DETAILED_VIDEO_ANALYSIS_ENVELOPE_SCHEMA, IMAGE_ANALYSIS_ENVELOPE_SCHEMA,
+    VIDEO_ANALYSIS_ENVELOPE_SCHEMA, validate_and_repair)
+from vision_backend import (SUPPORTED_VISION_BACKENDS, VisionBackendError,
+    analyze_image_with_vllm, check_vllm_server, complete_text_with_vllm, get_vision_backend,
+    sleep_vllm, wake_vllm)
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", str(BASE_DIR/"config"/"runtime.json")))
+if CONFIG_PATH.exists():
+    try:
+        for _key, _value in json.loads(CONFIG_PATH.read_text(encoding="utf-8")).items(): os.environ[str(_key)] = str(_value)
+    except Exception as _config_exc:
+        logging.getLogger("activity-recognition").warning("Could not load runtime config: %s", _config_exc)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("activity-recognition")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+MAX_VIDEO_DURATION_SECONDS = float(os.getenv("MAX_VIDEO_DURATION_SECONDS", "300"))
+MAX_VIDEO_FRAMES = int(os.getenv("MAX_VIDEO_FRAMES", "24"))
+FRAME_INTERVAL_SECONDS = float(os.getenv("FRAME_INTERVAL_SECONDS", "2"))
+VLLM_VISION_HOST = os.getenv("VLLM_VISION_HOST", "http://127.0.0.1:8001")
+VLLM_VISION_MODEL = os.getenv("VLLM_VISION_MODEL", "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit")
+
+class UploadTooLargeError(ValueError): pass
+
+class VisionManager:
+    """Thread-safe client for the single in-container vLLM engine (no fallback)."""
+    def __init__(self):
+        self.primary = get_vision_backend()
+        self.device = "cuda" if torch.cuda.is_available() else "unavailable"
+        self.lock = threading.RLock()
+        self.last_inference_ms = None
+
+    @staticmethod
+    def _normalize(text):
+        parsed = parse_json_text(text)
+        if "error" in parsed:
+            # Keep a short slice of the raw answer: without it a malformed frame
+            # is impossible to diagnose from the API response alone.
+            raise VisionBackendError(
+                f"Model returned invalid JSON: {parsed['error']} :: raw={str(parsed.get('raw'))[:200]}")
+        return normalize_activity_result(parsed)
+
+    def _vllm(self, path):
+        """Thermal-efficient default: the resident vLLM server (Qwen3-VL-8B)."""
+        return self._normalize(analyze_image_with_vllm(path, PROMPT, host=VLLM_VISION_HOST,
+            model=VLLM_VISION_MODEL, timeout=float(os.getenv("VLLM_VISION_TIMEOUT_SECONDS", "180"))))
+
+    def analyze(self, path):
+        """Classify one image with the resident vLLM engine. There is no fallback:
+        a failure here is reported to the caller instead of silently degrading."""
+        started = time.perf_counter()
+        with self.lock:
+            engine_power.ensure_awake()  # restore the engine if it was parked while idle
+            result, used = self._vllm(path), "vllm"
+        self.last_inference_ms = round((time.perf_counter()-started)*1000, 1)
+        return result, used
+
+    def set_primary(self, backend):
+        self.primary = get_vision_backend(backend)
+
+vision = VisionManager()
+# Idle power management: after VLLM_IDLE_SLEEP_SECONDS without a request the
+# engine is parked (weights offloaded to CPU, VRAM released) and the audio model
+# is unloaded, so other containers can use the GPU. The next request wakes it.
+engine_power = EnginePowerManager(sleep_vllm, wake_vllm, release_qwen_audio, host=VLLM_VISION_HOST,
+    idle_seconds=float(os.getenv("VLLM_IDLE_SLEEP_SECONDS", "60")))
+_db_pool, _db_lock = None, threading.Lock()
+
+class ObjectDetector:
+    """Lazy YOLO owner; keeps weights resident and avoids slowing API startup."""
+    def __init__(self):
+        self.model = None
+        self.lock = threading.Lock()
+        self.path = Path(os.getenv("OBJECT_MODEL_PATH", str(BASE_DIR/"object_detect_model_256_class.pt")))
+
+    def detect(self, path):
+        with self.lock:
+            if self.model is None:
+                if not self.path.exists(): raise VisionBackendError(f"Object model not found: {self.path}")
+                from ultralytics import YOLO
+                self.model = YOLO(str(self.path))
+            results = self.model(path, conf=float(os.getenv("OBJECT_CONFIDENCE","0.25")),
+                imgsz=int(os.getenv("OBJECT_IMAGE_SIZE","640")), verbose=False)
+        result = results[0]
+        rendered = result.plot()
+        import cv2
+        ok, encoded = cv2.imencode(".jpg", rendered, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        detections = []
+        for box, cls, confidence in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.cls.cpu().tolist(), result.boxes.conf.cpu().tolist()):
+            detections.append({"class": result.names[int(cls)], "confidence": round(float(confidence),4),
+                "bbox": {"x1":round(box[0],2),"y1":round(box[1],2),"x2":round(box[2],2),"y2":round(box[3],2)}})
+        counts = {}
+        for item in detections: counts[item["class"]] = counts.get(item["class"],0)+1
+        return {"detections":detections,"detected_object_counts":counts,
+            "annotated_image_base64":base64.b64encode(encoded).decode("ascii") if ok else None}
+
+    def track_frames(self, paths, timestamps):
+        """Track objects across sampled frames and return compact trajectories."""
+        tracks, observations = {}, []
+        with self.lock:
+            if self.model is None:
+                if not self.path.exists(): raise VisionBackendError(f"Object model not found: {self.path}")
+                from ultralytics import YOLO
+                self.model = YOLO(str(self.path))
+            # A fresh predictor prevents IDs leaking from a previous request.
+            self.model.predictor = None
+            for frame_index, (path, timestamp) in enumerate(zip(paths, timestamps)):
+                result = self.model.track(path, persist=True, tracker="bytetrack.yaml",
+                    conf=float(os.getenv("OBJECT_CONFIDENCE","0.25")),
+                    imgsz=int(os.getenv("OBJECT_IMAGE_SIZE","640")), device=0, verbose=False)[0]
+                frame_items = []
+                if result.boxes is not None and len(result.boxes):
+                    ids = result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [-1] * len(result.boxes)
+                    for track_id, cls, confidence, box in zip(ids, result.boxes.cls.cpu().tolist(),
+                            result.boxes.conf.cpu().tolist(), result.boxes.xyxy.cpu().tolist()):
+                        label = result.names[int(cls)]
+                        item = {"track_id":int(track_id), "class":label,
+                            "confidence":round(float(confidence),4),
+                            "bbox":[round(float(value),2) for value in box]}
+                        frame_items.append(item)
+                        if track_id >= 0:
+                            key = str(track_id)
+                            track = tracks.setdefault(key, {"track_id":int(track_id), "class":label,
+                                "first_seen_sec":timestamp, "last_seen_sec":timestamp,
+                                "observations":0, "max_confidence":0.0})
+                            track["last_seen_sec"], track["observations"] = timestamp, track["observations"] + 1
+                            track["max_confidence"] = max(track["max_confidence"], round(float(confidence),4))
+                observations.append({"frame_index":frame_index,"timestamp_sec":timestamp,"objects":frame_items})
+        # Tracking weights are cheap to reload and must not compete with later audio stages.
+        with self.lock: self.model = None
+        gc.collect(); torch.cuda.empty_cache()
+        return {"tracks":list(tracks.values()),"frame_observations":observations}
+
+detector = ObjectDetector()
+_detailed_video_lock = threading.Lock()
+
+def _run_audio_stage(video_path, audio):
+    """Run the Qwen2-Audio stage strictly after all vLLM vision work.
+
+    Vision and audio share one (already partly occupied) GPU and cannot both be
+    resident, so the engine is parked for the audio stage and restored after.
+    This runs under AUDIO_STAGE_LOCK and the vision lock, so a concurrent
+    request cannot start vLLM frame inference while Qwen2-Audio is generating.
+    """
+    with AUDIO_STAGE_LOCK, vision.lock:
+        try:
+            # Park the engine so the audio model gets the whole card; the audio
+            # model is released and the engine restored in the finally block.
+            engine_power.park()
+            return analyze_video_audio(video_path, device=vision.device)
+        except Exception as exc:
+            logger.exception("Audio analysis failed")
+            failed = dict(audio)
+            failed["warnings"] = list(failed.get("warnings", [])) + [str(exc)]
+            return failed
+        finally:
+            engine_power.restore()
+
+def _analyze_frame_resilient(frame, index):
+    """Classify one frame, retrying once before giving up on it.
+
+    A single frame the model answers with malformed JSON must not abort the
+    whole video: the frame is retried once and, if it still fails, skipped and
+    reported as a warning so the remaining evidence is still analysed. Returns
+    (result, backend, warning); result is None when the frame was skipped.
+    """
+    error = None
+    for _ in range(2):
+        try:
+            result, backend = vision.analyze(frame)
+            return result, backend, None
+        except VisionBackendError as exc:
+            error = exc
+    return None, None, f"frame {index} skipped after retry: {error}"
+
+def get_db_pool():
+    global _db_pool
+    if _db_pool is None:
+        with _db_lock:
+            if _db_pool is None:
+                from psycopg2.pool import ThreadedConnectionPool
+                _db_pool = ThreadedConnectionPool(1, int(os.getenv("DB_POOL_MAX","10")), dbname=os.environ["DB_NAME"],
+                    user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"], host=os.environ["DB_HOST"],
+                    port=int(os.getenv("DB_PORT","5432")), connect_timeout=5)
+    return _db_pool
+
+@contextmanager
+def db_cursor():
+    pool, conn = get_db_pool(), None
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cursor: yield conn, cursor
+    except Exception:
+        conn.rollback(); raise
+    finally: pool.putconn(conn)
+
+def save_upload():
+    upload = request.files.get("file")
+    if not upload or not upload.filename: raise ValueError("Missing non-empty 'file' field")
+    if request.content_length and request.content_length > MAX_UPLOAD_BYTES: raise UploadTooLargeError("Upload is too large")
+    handle, path = tempfile.mkstemp(prefix="activity_", suffix=Path(upload.filename).suffix.lower()); os.close(handle)
+    upload.save(path)
+    if Path(path).stat().st_size > MAX_UPLOAD_BYTES:
+        Path(path).unlink(missing_ok=True); raise UploadTooLargeError("Upload is too large")
+    return path, Path(upload.filename).name
+
+def _decode_frames_to_disk(reader, indices, prefix="frame_", quality=85):
+    """Decode the given frame indices in bounded batches and save them as JPEGs.
+
+    Batching keeps peak RAM flat even when the frame budget is unlimited and
+    the video is long.
+    """
+    batch_size = max(1, int(os.getenv("DECORD_BATCH_FRAMES", "48")))
+    paths = []
+    for start in range(0, len(indices), batch_size):
+        for frame in reader.get_batch([int(i) for i in indices[start:start + batch_size]]).asnumpy():
+            handle, frame_path = tempfile.mkstemp(prefix=prefix, suffix=".jpg"); os.close(handle)
+            Image.fromarray(frame).save(frame_path, quality=quality, optimize=True); paths.append(frame_path)
+    return paths
+
+def sample_video_frames(path):
+    reader = VideoReader(path, ctx=cpu(0), num_threads=max(1, int(os.getenv("DECORD_THREADS","2"))))
+    count, fps = len(reader), float(reader.get_avg_fps())
+    if count == 0 or fps <= 0: raise MediaProbeError("Video contains no decodable frames")
+    max_frames = int(os.getenv("MAX_VIDEO_FRAMES", str(MAX_VIDEO_FRAMES)))
+    interval = float(os.getenv("FRAME_INTERVAL_SECONDS", str(FRAME_INTERVAL_SECONDS)))
+    desired = max(1, int(np.ceil((count/fps)/interval)))
+    if max_frames > 0: desired = min(max_frames, desired)  # 0 or negative = unlimited
+    indices = np.unique(np.linspace(0, count-1, desired, dtype=np.int64))
+    paths = _decode_frames_to_disk(reader, indices)
+    return paths, [round(float(i)/fps,2) for i in indices]
+
+def sample_detailed_video_frames(path):
+    """Combine uniform coverage with high-change frames that may contain brief events."""
+    reader = VideoReader(path, ctx=cpu(0), num_threads=max(1, int(os.getenv("DECORD_THREADS","2"))))
+    count, fps = len(reader), float(reader.get_avg_fps())
+    if count == 0 or fps <= 0: raise MediaProbeError("Video contains no decodable frames")
+    duration = count / fps
+    max_frames = int(os.getenv("MAX_VIDEO_FRAMES", str(MAX_VIDEO_FRAMES)))
+    interval = float(os.getenv("FRAME_INTERVAL_SECONDS", str(FRAME_INTERVAL_SECONDS)))
+    uniform_count = max(1, int(np.ceil(duration / interval)))
+    if max_frames > 0: uniform_count = min(max_frames, uniform_count)  # 0 or negative = unlimited
+    uniform = np.unique(np.linspace(0, count - 1, uniform_count, dtype=np.int64))
+    candidate_count = min(count, max(uniform_count * 4, 12))
+    candidates = np.unique(np.linspace(0, count - 1, candidate_count, dtype=np.int64))
+    scores = []
+    previous = None
+    candidate_batch = max(1, int(os.getenv("DECORD_BATCH_FRAMES", "48")))
+    for start in range(0, len(candidates), candidate_batch):
+        candidate_frames = reader.get_batch([int(i) for i in candidates[start:start + candidate_batch]]).asnumpy()
+        for index, frame in zip(candidates[start:start + candidate_batch], candidate_frames):
+            gray = np.asarray(Image.fromarray(frame).resize((96, 54)).convert("L"), dtype=np.float32)
+            score = 0.0 if previous is None else float(np.mean(np.abs(gray - previous)) / 255.0)
+            scores.append((score, int(index))); previous = gray
+        del candidate_frames
+    crucial_limit = int(os.getenv("MAX_CRUCIAL_FRAMES", "6"))
+    minimum_gap = max(1, int(fps * float(os.getenv("CRUCIAL_FRAME_MIN_GAP_SECONDS", "0.75"))))
+    crucial = []
+    for score, index in sorted(scores, reverse=True):
+        if score < float(os.getenv("CRUCIAL_FRAME_SCORE_THRESHOLD", "0.08")): break
+        if all(abs(index - selected[1]) >= minimum_gap for selected in crucial):
+            crucial.append((score, index))
+        if len(crucial) >= crucial_limit: break
+    crucial_scores = {index:score for score,index in crucial}
+    indices = sorted(set(uniform.tolist()) | set(crucial_scores))
+    paths, selection = [], []
+    batch_size = max(1, int(os.getenv("DECORD_BATCH_FRAMES", "48")))
+    uniform_set = set(uniform.tolist())
+    for start in range(0, len(indices), batch_size):
+        batch_indices = indices[start:start + batch_size]
+        for index, frame in zip(batch_indices, reader.get_batch([int(i) for i in batch_indices]).asnumpy()):
+            handle, frame_path = tempfile.mkstemp(prefix="frame_", suffix=".jpg"); os.close(handle)
+            Image.fromarray(frame).save(frame_path, quality=88, optimize=True); paths.append(frame_path)
+            reasons = []
+            if index in uniform_set: reasons.append("uniform_timeline")
+            if index in crucial_scores: reasons.append("scene_change_or_motion_peak")
+            selection.append({"reasons":reasons,"change_score":round(crucial_scores.get(index,0.0),4)})
+    scores = [round(float(score), 4) for score in compute_frame_change_scores(paths)]
+    return paths, [round(float(i)/fps,2) for i in indices], selection, scores
+
+def _decide_dominant_activity(activity_counts, evidence_biases):
+    """Fuse visual frame votes with cadence/motion biases from other modalities.
+
+    Unanimous non-visual evidence can confirm the visual winner, override a
+    split vote, or decide when frames carry no usable labels; conflicting
+    evidence defers to the visual counts.
+    """
+    dominant = max(activity_counts, key=activity_counts.get) if activity_counts else "miscellaneous"
+    votes = {}
+    for bias in evidence_biases:
+        if bias: votes[bias] = votes.get(bias, 0) + 1
+    if not votes or len(votes) > 1: return dominant, "visual_frame_votes"
+    best_bias = next(iter(votes))
+    if not activity_counts: return best_bias, "multimodal_evidence_consensus"
+    strongest = max(activity_counts.items(), key=lambda item: item[1])
+    if strongest[0] == best_bias: return dominant, "multimodal_evidence_agreement"
+    runner_up = sorted(activity_counts.values(), reverse=True)[1] if len(activity_counts) >= 2 else 0
+    if (strongest[1] - runner_up) <= 2: return best_bias, "multimodal_evidence_override"
+    return dominant, "visual_frame_votes"
+
+def _video_level_activity(frames, audio, activity_counts):
+    """Decide the whole-video activity with one reasoning pass over all evidence.
+
+    Per-frame voting loses mission context (a video of an active operation is
+    dominated by frames that only show transport, so the vote returns the
+    generic label). This pass reviews every frame observation plus the transcript
+    and sound events and returns one label. It returns None when the pass is
+    unusable, so callers keep their vote-based answer.
+    """
+    if not frames:
+        return None
+    transcript = " ".join(segment.get("text", "") for segment in (audio.get("transcript") or []))
+    prompt = build_video_activity_prompt(frames, activity_counts, transcript,
+        audio.get("sound_events") or [])
+    try:
+        engine_power.ensure_awake()
+        raw = complete_text_with_vllm(prompt, host=VLLM_VISION_HOST, model=VLLM_VISION_MODEL,
+            max_tokens=int(os.getenv("VLLM_VIDEO_LEVEL_MAX_TOKENS", "320")))
+    except Exception as exc:
+        logger.warning("Video-level reasoning unavailable: %s", exc)
+        return None
+    parsed = parse_json_text(raw)
+    activity = str(parsed.get("activity", "")).strip().lower()
+    if activity not in ACTIVITY_LABELS:
+        logger.warning("Video-level reasoning returned an unusable label: %r", activity)
+        return None
+    return {"activity": activity,
+        "confidence": normalize_confidence(parsed.get("confidence")),
+        "reasoning": parsed.get("reasoning")}
+
+
+def _generate_cross_modal_summary(prompt):
+    """Best-effort cross-modal synthesis on the vLLM engine; None when unavailable."""
+    try:
+        engine_power.ensure_awake()
+        return complete_text_with_vllm(prompt, host=VLLM_VISION_HOST, model=VLLM_VISION_MODEL)
+    except Exception as exc:
+        logger.warning("Cross-modal summary unavailable: %s", exc)
+        return None
+
+def analyze_video_file(path):
+    metadata = validate_video_duration(path, float(os.getenv("MAX_VIDEO_DURATION_SECONDS", str(MAX_VIDEO_DURATION_SECONDS))))
+    paths, timestamps = sample_video_frames(path); results, backends = [], set()
+    frame_warnings = []
+    change_scores = []
+    try:
+        for index, (frame, timestamp) in enumerate(zip(paths, timestamps)):
+            result, backend, warning = _analyze_frame_resilient(frame, index)
+            if warning: frame_warnings.append(warning); continue
+            backends.add(backend)
+            results.append({"frame_index":index,"timestamp_sec":timestamp,**result})
+        change_scores = compute_frame_change_scores(paths)
+    finally:
+        for frame in paths: Path(frame).unlink(missing_ok=True)
+    # Strict stage ordering: all vision inference (vLLM server calls) is already
+    # complete here; the audio stage runs next, never concurrently with it.
+    audio = {"has_audio":metadata["has_audio"],"transcript":[],"sound_events":[],"warnings":[]}
+    if metadata["has_audio"] and os.getenv("ENABLE_AUDIO_ANALYSIS","1") == "1":
+        # Vision finished above; the audio stage sleeps the vLLM engine first.
+        audio = _run_audio_stage(path, audio)
+    cadence = audio.get("firing_cadence") if isinstance(audio, dict) else None
+    ast_cadence = audio.get("sound_event_cadence") if isinstance(audio, dict) else None
+    motion = analyze_motion_burstiness(change_scores)
+    evidence_biases = [cadence_activity_bias(cadence), sound_event_cadence_bias(ast_cadence), motion_activity_bias(motion)]
+    activities = sorted({a for frame in results for a in frame.get("detected_activity",[])})
+    summary = {"detected_activities":activities or ["miscellaneous"],"frames_analyzed":len(results),"duration_sec":metadata["duration_sec"]}
+    activity_counts, confidence_counts = {}, {level:0 for level in CONFIDENCE_LEVELS}
+    confidence_values = []
+    for frame in results:
+        for activity in frame.get("detected_activity",[]):
+            activity_counts[activity] = activity_counts.get(activity, 0) + 1
+        confidence = normalize_confidence(frame.get("confidence"))
+        confidence_values.append(confidence)
+        confidence_counts[confidence_label(confidence)] += 1
+    confidence_summary = {
+        "mean": round(sum(confidence_values) / len(confidence_values), 4) if confidence_values else None,
+        "min": round(min(confidence_values), 4) if confidence_values else None,
+        "max": round(max(confidence_values), 4) if confidence_values else None,
+        "frames": len(confidence_values),
+    }
+    dominant, basis = _decide_dominant_activity(activity_counts, evidence_biases)
+    # The whole-video reasoning pass is the final authority: it sees every frame
+    # plus the audio evidence and is not fooled by a dominant generic frame label.
+    video_level = _video_level_activity(results, audio, activity_counts)
+    if video_level: dominant, basis = video_level["activity"], "video_level_reasoning"
+    transcript = " ".join(segment.get("text","") for segment in audio.get("transcript",[])).strip()
+    sound_cues = sorted({event.get("label") for event in audio.get("sound_events",[]) if event.get("label")})
+    timeline = [{"timestamp_sec":frame["timestamp_sec"],"activities":frame.get("detected_activity",[]),
+        "scene":frame.get("scene_summary",""),"confidence":frame.get("confidence",0.0)}
+        for frame in results]
+    if basis in {"multimodal_evidence_override", "multimodal_evidence_consensus"}:
+        reasons = []
+        if cadence_activity_bias(cadence): reasons.append(f"the audio firing rhythm ({cadence.get('classification')} discharges, median gap {cadence.get('median_gap_sec')}s)")
+        if sound_event_cadence_bias(ast_cadence): reasons.append(f"acoustic event spacing ({ast_cadence.get('classification')})")
+        if motion_activity_bias(motion): reasons.append(f"the inter-frame motion rhythm ({motion.get('classification')})")
+        narrative = (f"Analyzed {len(results)} sampled frames across {metadata['duration_sec']:.2f} seconds. "
+            f"Frame-level visual evidence was split between {', '.join(sorted(activity_counts)) or 'unclassified scenes'}; "
+            + " and ".join(reasons) + f" identified {dominant} as the dominant activity. "
+            "See the timeline and modality fields for the supporting evidence and uncertainty.")
+    else:
+        narrative = (f"Analyzed {len(results)} sampled frames across {metadata['duration_sec']:.2f} seconds. "
+            f"The most frequently observed activity was {dominant}, supported in "
+            f"{activity_counts.get(dominant,0)} frame(s). "
+            f"Audio was {'available and analyzed' if audio.get('has_audio') else 'not available'}. "
+            "See the timeline and modality fields for the supporting evidence and uncertainty.")
+    overall = {"narrative":narrative,"dominant_activity":dominant,"dominant_activity_basis":basis,
+        "video_level_reasoning":video_level,
+        "frame_warnings":frame_warnings,
+        "firing_cadence":cadence if isinstance(cadence, dict) else None,
+        "motion_burstiness":motion,"evidence_biases":[bias for bias in evidence_biases if bias],
+        "activity_frequency":activity_counts,"confidence_distribution":confidence_counts,"confidence_summary":confidence_summary,
+        "timeline":timeline,"transcript":transcript or None,"sound_cues":sound_cues,
+        "audio_warnings":audio.get("warnings",[]),"backends_used":sorted(backends)}
+    return {"frame_analysis":results,"audio_analysis":audio,"activity_summary":summary,
+        "overall_analysis":overall,"backends_used":sorted(backends)}
+
+def _build_detailed_report(metadata, frames, tracking, audio):
+    activities = {}
+    for frame in frames:
+        for label in frame.get("detected_activity", []):
+            activities.setdefault(label, []).append(frame["timestamp_sec"])
+    evidence = [{"activity":label,"first_seen_sec":min(times),"last_seen_sec":max(times),
+        "supporting_frames":len(times)} for label,times in sorted(activities.items())]
+    chronology = [{"timestamp_sec":frame["timestamp_sec"],"scene":frame.get("scene_summary",""),
+        "activities":frame.get("detected_activity",[]),"confidence":frame.get("confidence",0.0)}
+        for frame in frames]
+    transcript = " ".join(segment.get("text", "") for segment in audio.get("transcript",[])).strip()
+    confidences = [normalize_confidence(frame.get("confidence")) for frame in frames]
+    confidence_distribution = {level:0 for level in CONFIDENCE_LEVELS}
+    for value in confidences: confidence_distribution[confidence_label(value)] += 1
+    confidence_summary = {"mean": round(sum(confidences) / len(confidences), 4) if confidences else None,
+        "min": round(min(confidences), 4) if confidences else None,
+        "max": round(max(confidences), 4) if confidences else None, "frames": len(confidences)}
+    return {        "executive_overview":{
+            "duration_sec":metadata["duration_sec"],"frames_analyzed":len(frames),
+            "persistent_tracks":len(tracking.get("tracks",[])),
+            "activities":list(activities) or ["miscellaneous"],
+            "confidence_distribution":confidence_distribution,
+            "confidence_summary":confidence_summary,
+            "audio_available":audio.get("has_audio",False)},
+        "chronology":chronology,"activity_evidence":evidence,
+        "spoken_content":transcript or None,
+        "cross_modal_notes":[
+            "Visual activity labels come from timestamped frame evidence.",
+            "Speech is reported as transcript and is not treated as visual proof.",
+            "Sound-event labels are acoustic cues and may require human confirmation."],
+        "limitations":["Sampling can miss events occurring between analyzed frames.",
+            "Track IDs may change after occlusion or major camera cuts.",
+            "Model predictions are decision support and require review for high-impact use."]}
+
+def analyze_video_detailed_file(path, original_filename=None):
+    """Run all video modalities serially to keep GPU memory predictable."""
+    with _detailed_video_lock:
+        metadata = validate_video_duration(path, float(os.getenv("MAX_VIDEO_DURATION_SECONDS", str(MAX_VIDEO_DURATION_SECONDS))))
+        paths, timestamps, selections, change_scores = sample_detailed_video_frames(path)
+        frames, backends = [], set()
+        frame_warnings = []
+        try:
+            for index, (frame, timestamp, selection) in enumerate(zip(paths, timestamps, selections)):
+                result, backend, warning = _analyze_frame_resilient(frame, index)
+                if warning: frame_warnings.append(warning); continue
+                backends.add(backend)
+                frames.append({"frame_index":index,"timestamp_sec":timestamp,
+                    "frame_selection":selection,**result})
+            # Every frame failing means the engine is unusable; report that
+            # plainly instead of returning an all-"miscellaneous" report.
+            if not frames:
+                raise VisionBackendError("No frame could be analyzed: " +
+                    (frame_warnings[0] if frame_warnings else "unknown vision error"))
+            tracking = detector.track_frames(paths, timestamps)
+            audio = {"has_audio":metadata["has_audio"],"transcript":[],"sound_events":[],"warnings":[]}
+            if metadata["has_audio"] and os.getenv("ENABLE_AUDIO_ANALYSIS","1") == "1":
+                # Vision (frames + tracking) finished above; the audio stage now
+                # sleeps the vLLM engine so Qwen2-Audio gets the GPU to itself.
+                audio = _run_audio_stage(path, audio)
+            motion = analyze_motion_burstiness(change_scores)
+            ast_cadence = audio.get("sound_event_cadence") if isinstance(audio, dict) else None
+            activity_counts = {}
+            for frame in frames:
+                for label in frame.get("detected_activity", []):
+                    activity_counts[label] = activity_counts.get(label, 0) + 1
+            dominant, basis = _decide_dominant_activity(activity_counts,
+                [cadence_activity_bias(audio.get("firing_cadence")), sound_event_cadence_bias(ast_cadence), motion_activity_bias(motion)])
+            # Final authority: one reasoning pass over all frames + the audio
+            # evidence, so a dominant generic frame label cannot decide alone.
+            video_level = _video_level_activity(frames, audio, activity_counts)
+            if video_level: dominant, basis = video_level["activity"], "video_level_reasoning"
+            report = _build_detailed_report(metadata, frames, tracking, audio)
+            report["video_level_reasoning"] = video_level
+            report["motion_burstiness"] = motion
+            report["executive_overview"]["dominant_activity"] = dominant
+            report["executive_overview"]["dominant_activity_basis"] = basis
+            report["cross_modal_summary"] = _generate_cross_modal_summary(
+                build_multimodal_summary_prompt(frames, audio.get("transcript",[]), audio.get("sound_events",[])))
+            if frame_warnings: report.setdefault("limitations", []).extend(frame_warnings)
+            analysis = {"metadata":metadata,"detailed_report":report,"frame_analysis":frames,
+                "frame_warnings":frame_warnings,
+                "object_tracking":tracking,
+                "audio_analysis":audio,"motion_burstiness":motion,
+                "backends_used":sorted(backends)}
+            # Report rendering is opt-out: skipping it removes PDF build time
+            # (and its reportlab layout work) from the request path entirely.
+            if os.getenv("REPORTING_ENABLED", "1") == "1":
+                analysis["report"] = create_video_analysis_pdf(analysis, paths,
+                    original_filename or Path(path).name)
+            else:
+                analysis["report"] = {"skipped": True,
+                    "reason": "REPORTING_ENABLED is off; PDF rendering was skipped to reduce latency"}
+            return analysis
+        finally:
+            for frame in paths: Path(frame).unlink(missing_ok=True)
+
+app = Flask(__name__, template_folder=str(BASE_DIR/"templates")); app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+CORS(app, resources={r"/analyze-*":{"origins":os.getenv("CORS_ORIGINS","*")}})
+Swagger(app, template={"swagger":"2.0","info":{"title":"Activity Recognition API","version":"2.0.0",
+    "description":"Single-container activity recognition: in-container vLLM (Qwen3-VL-8B int4) and Qwen2-Audio"}}, config={"headers":[],"specs":[{"endpoint":"apispec",
+    "route":"/apispec.json","rule_filter":lambda rule:True,"model_filter":lambda tag:True}],"swagger_ui":True,
+    "specs_route":"/docs/","static_url_path":"/flasgger_static"})
+
+@app.before_request
+def _track_request_activity():
+    # /health is excluded: the container healthcheck polls it every 30s and must
+    # not keep the GPU awake. Every other request counts as activity.
+    if request.path == "/health": return
+    g.power_tracked = True
+    engine_power.enter()
+
+@app.teardown_request
+def _untrack_request_activity(exc=None):
+    if getattr(g, "power_tracked", False):
+        g.power_tracked = False
+        engine_power.exit()
+
+engine_power.start()
+
+@app.route("/", methods=["GET"])
+def dashboard(): return render_template("dashboard.html", max_upload_mb=MAX_UPLOAD_BYTES//1048576)
+
+CONFIG_FIELDS = {
+    "MAX_VIDEO_FRAMES": (int, 0, 100000), "FRAME_INTERVAL_SECONDS": (float, 0.25, 30),
+    "MAX_CRUCIAL_FRAMES": (int, 0, 24),
+    "CRUCIAL_FRAME_SCORE_THRESHOLD": (float, 0, 1),
+    "CRUCIAL_FRAME_MIN_GAP_SECONDS": (float, 0.1, 30),
+    "AUDIO_EVENT_WINDOW_SECONDS": (int, 1, 60), "AUDIO_EVENT_HOP_SECONDS": (int, 1, 60),
+    "AUDIO_EVENT_CONFIDENCE_THRESHOLD": (float, 0, 1),
+    "OBJECT_CONFIDENCE": (float, 0, 1), "OBJECT_IMAGE_SIZE": (int, 256, 1280),
+    "MAX_VIDEO_DURATION_SECONDS": (float, 1, 3600),
+    "REPORTING_ENABLED": (int, 0, 1),
+}
+CONFIG_DEFAULTS = {"MAX_VIDEO_FRAMES":0,"FRAME_INTERVAL_SECONDS":1,
+    "MAX_CRUCIAL_FRAMES":6,"CRUCIAL_FRAME_SCORE_THRESHOLD":0.08,"CRUCIAL_FRAME_MIN_GAP_SECONDS":0.75,
+    "AUDIO_EVENT_WINDOW_SECONDS":10,"AUDIO_EVENT_HOP_SECONDS":5,
+    "AUDIO_EVENT_CONFIDENCE_THRESHOLD":0.35,"OBJECT_CONFIDENCE":0.25,
+    "OBJECT_IMAGE_SIZE":640,"MAX_VIDEO_DURATION_SECONDS":300,"REPORTING_ENABLED":1}
+
+def current_config():
+    values = {key:caster(os.getenv(key, str(CONFIG_DEFAULTS[key]))) for key,(caster,_,_) in CONFIG_FIELDS.items()}
+    values["AUDIO_EVENT_OVERLAP_SECONDS"] = max(0, values["AUDIO_EVENT_WINDOW_SECONDS"] - values["AUDIO_EVENT_HOP_SECONDS"])
+    return values
+
+@app.route("/config", methods=["GET"])
+@swag_from(GET_CONFIG_SWAGGER_DOC)
+def get_config(): return jsonify({"configuration":current_config(),"persisted_path":str(CONFIG_PATH)})
+
+@app.route("/config", methods=["POST"])
+@swag_from(SET_CONFIG_SWAGGER_DOC)
+def set_config():
+    payload = request.get_json(silent=True) or {}
+    if "AUDIO_EVENT_OVERLAP_SECONDS" in payload:
+        payload["AUDIO_EVENT_HOP_SECONDS"] = float(payload.get("AUDIO_EVENT_WINDOW_SECONDS",
+            current_config()["AUDIO_EVENT_WINDOW_SECONDS"])) - float(payload.pop("AUDIO_EVENT_OVERLAP_SECONDS"))
+    unknown = set(payload) - set(CONFIG_FIELDS)
+    if unknown: return jsonify({"error":f"Unknown settings: {sorted(unknown)}"}),400
+    saved = current_config(); saved.pop("AUDIO_EVENT_OVERLAP_SECONDS", None)
+    try:
+        for key,value in payload.items():
+            caster,minimum,maximum = CONFIG_FIELDS[key]; parsed = caster(value)
+            if not minimum <= parsed <= maximum: raise ValueError(f"{key} must be between {minimum} and {maximum}")
+            saved[key] = parsed
+        if saved["AUDIO_EVENT_HOP_SECONDS"] > saved["AUDIO_EVENT_WINDOW_SECONDS"]:
+            raise ValueError("Audio overlap cannot be negative; hop must not exceed window")
+    except (TypeError,ValueError) as exc: return jsonify({"error":str(exc)}),400
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(saved, indent=2, sort_keys=True), encoding="utf-8")
+    for key,value in saved.items(): os.environ[key] = str(value)
+    return jsonify({"status":"saved","configuration":current_config(),"persisted_path":str(CONFIG_PATH)})
+
+@app.route("/reports/<path:filename>", methods=["GET"])
+@swag_from(DOWNLOAD_REPORT_SWAGGER_DOC)
+def download_report(filename):
+    return send_from_directory(os.getenv("REPORTS_DIR", "/app/reports"), filename,
+        as_attachment=True, download_name=filename)
+
+@app.route("/health", methods=["GET"])
+@swag_from(HEALTH_SWAGGER_DOC)
+def health():
+    cuda_ready = torch.cuda.is_available()
+    vllm_status = check_vllm_server(host=VLLM_VISION_HOST, model=VLLM_VISION_MODEL, timeout=1.5)
+    payload = {"status":"ok" if cuda_ready else "unavailable","service":"activity-recognition","version":"2.0.0",
+        "primary_backend":vision.primary,"vision_model":VLLM_VISION_MODEL,
+        "audio_model":QWEN_AUDIO_MODEL_ID,"device":vision.device,"vllm_server":vllm_status,
+        "cuda_required":True,"cuda_available":cuda_ready}
+    return jsonify(payload), 200 if cuda_ready else 503
+
+@app.route("/vision-backend", methods=["GET"])
+@swag_from(GET_VISION_BACKEND_SWAGGER_DOC)
+def backend_status():
+    return jsonify({"vision_backend":vision.primary,"vision_model":VLLM_VISION_MODEL,
+        "audio_model":QWEN_AUDIO_MODEL_ID,"available_backends":sorted(SUPPORTED_VISION_BACKENDS),
+        "last_inference_ms":vision.last_inference_ms})
+
+@app.route("/vision-backend", methods=["POST"])
+@swag_from(SET_VISION_BACKEND_SWAGGER_DOC)
+def set_backend():
+    backend = (request.get_json(silent=True) or {}).get("backend")
+    if not backend: return jsonify({"error":"Missing 'backend'","available_backends":sorted(SUPPORTED_VISION_BACKENDS)}),400
+    try: vision.set_primary(backend)
+    except VisionBackendError as exc: return jsonify({"error":str(exc)}),400
+    except Exception as exc:
+        logger.exception("Backend activation failed"); return jsonify({"error":f"Unable to activate {backend}: {exc}"}),502
+    return backend_status()
+
+@app.route("/analyze-image", methods=["POST"])
+@swag_from(ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC)
+def analyze_image_upload():
+    path = None
+    try:
+        path, name = save_upload()
+        if Path(path).suffix.lower() not in IMAGE_EXTENSIONS: return jsonify({"error":"Unsupported image format"}),400
+        with Image.open(path) as image: image.verify()
+        result, backend = vision.analyze(path)
+        payload = {"filename":name,"media_type":"image","backend_used":backend,"analysis":result}
+        return jsonify(validate_and_repair(payload, IMAGE_ANALYSIS_ENVELOPE_SCHEMA))
+    except UnidentifiedImageError: return jsonify({"error":"Invalid or unreadable image"}),400
+    finally:
+        if path: Path(path).unlink(missing_ok=True)
+
+@app.route("/analyze-video", methods=["POST"])
+@swag_from(ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC)
+def analyze_video_upload():
+    path = None
+    try:
+        path, name = save_upload()
+        if Path(path).suffix.lower() not in VIDEO_EXTENSIONS: return jsonify({"error":"Unsupported video format"}),400
+        payload = {"filename":name,"media_type":"video","analysis":analyze_video_file(path)}
+        return jsonify(validate_and_repair(payload, VIDEO_ANALYSIS_ENVELOPE_SCHEMA))
+    finally:
+        if path: Path(path).unlink(missing_ok=True)
+
+@app.route("/analyze-video-detailed", methods=["POST"])
+@swag_from(ANALYZE_VIDEO_DETAILED_SWAGGER_DOC)
+def analyze_video_detailed_upload():
+    path = None
+    try:
+        path, name = save_upload()
+        if Path(path).suffix.lower() not in VIDEO_EXTENSIONS: return jsonify({"error":"Unsupported video format"}),400
+        payload = {"filename":name,"media_type":"video","analysis":analyze_video_detailed_file(path, name)}
+        return jsonify(validate_and_repair(payload, DETAILED_VIDEO_ANALYSIS_ENVELOPE_SCHEMA))
+    finally:
+        if path: Path(path).unlink(missing_ok=True)
+
+@app.route("/fetch-media", methods=["POST"])
+@swag_from(FETCH_MEDIA_SWAGGER_DOC)
+def fetch_media():
+    record_id = (request.get_json(silent=True) or {}).get("id")
+    if record_id is None: return jsonify({"error":"Missing id"}),400
+    with db_cursor() as (conn,cursor):
+        cursor.execute("SELECT file_path FROM public.media_analysis WHERE id=%s",(record_id,)); row=cursor.fetchone()
+        if not row: return jsonify({"error":"No record found"}),404
+        value = row[0][0] if isinstance(row[0],list) else row[0]; parsed=urlparse(str(value))
+        if parsed.scheme not in {"http","https"} or not parsed.hostname: raise ValueError("Invalid media URL")
+        handle,path=tempfile.mkstemp(prefix="remote_",suffix=Path(parsed.path).suffix.lower()); os.close(handle)
+        try:
+            with requests.get(str(value),stream=True,timeout=(5,60)) as response:
+                response.raise_for_status(); size=0
+                with open(path,"wb") as target:
+                    for chunk in response.iter_content(1048576):
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES: raise UploadTooLargeError("Remote media is too large")
+                        target.write(chunk)
+            if Path(path).suffix.lower() in VIDEO_EXTENSIONS: result=analyze_video_file(path)
+            else:
+                result,backend=vision.analyze(path); result={**result,"backend_used":backend}
+            cursor.execute("UPDATE public.media_analysis SET analysis_summary=%s,status=%s WHERE id=%s",(json.dumps(result),1,record_id)); conn.commit()
+            return jsonify({"id":record_id,"status":1,"analysis":result})
+        finally: Path(path).unlink(missing_ok=True)
+
+@app.route("/detect-objects", methods=["POST"])
+@swag_from(DETECT_OBJECTS_SWAGGER_DOC)
+def detect_objects_api():
+    path = None
+    try:
+        path, name = save_upload()
+        if Path(path).suffix.lower() not in IMAGE_EXTENSIONS: return jsonify({"error":"Unsupported image format"}),400
+        with Image.open(path) as image: image.verify()
+        return jsonify({"filename":name,"object_detection":detector.detect(path)})
+    finally:
+        if path: Path(path).unlink(missing_ok=True)
+
+@app.errorhandler(UploadTooLargeError)
+@app.errorhandler(VideoTooLongError)
+def too_large(exc): return jsonify({"error":str(exc)}),413
+@app.errorhandler(MediaProbeError)
+@app.errorhandler(ValueError)
+def bad_media(exc): return jsonify({"error":str(exc)}),400
+@app.errorhandler(VisionBackendError)
+def backend_failure(exc): return jsonify({"error":str(exc)}),502
+@app.errorhandler(413)
+def flask_too_large(_): return jsonify({"error":"Upload is too large"}),413
+@app.errorhandler(Exception)
+def unhandled(exc):
+    if isinstance(exc, HTTPException):
+        return jsonify({"error":exc.description}),exc.code
+    logger.exception("Unhandled request failure"); return jsonify({"error":"Internal server error"}),500
+
+if __name__ == "__main__": app.run(host="0.0.0.0",port=5009,debug=False)

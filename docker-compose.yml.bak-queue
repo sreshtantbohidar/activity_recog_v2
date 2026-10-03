@@ -1,0 +1,98 @@
+services:
+  # One container, one GPU: the vLLM engine (Qwen3-VL-8B int4 AWQ) is started by
+  # the entrypoint inside this service, and the API runs the Qwen2-Audio stage
+  # while the engine sleeps. There is no second model server and no fallback.
+  activity-recognition:
+    build:
+      context: .
+      args:
+        PRELOAD_MODELS: ${PRELOAD_MODELS:-0}
+    image: activity-recognition:2.0.0
+    ports:
+      - "${ACTIVITY_PORT:-5009}:5009"
+    environment:
+      ACTIVITY_VISION_BACKEND: vllm
+      VLLM_VISION_HOST: http://127.0.0.1:8001
+      VLLM_MODEL_ID: ${VLLM_MODEL_ID:-cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit}
+      VLLM_VISION_MODEL: ${VLLM_VISION_MODEL:-cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit}
+      QWEN_AUDIO_MODEL_ID: ${QWEN_AUDIO_MODEL_ID:-Qwen/Qwen2-Audio-7B-Instruct}
+      QWEN_AUDIO_LOAD_IN_4BIT: ${QWEN_AUDIO_LOAD_IN_4BIT:-1}
+      REQUIRE_CUDA: "1"
+      # The app uses ONLY the 24 GB card. Both host GPUs are attached to the
+      # container (see the reservation below) and CUDA is then pinned to the
+      # RTX PRO 4000 Blackwell, the device on PCI bus 1. The host's other card
+      # is a 4 GB Quadro K2200 (compute capability 5.0) that cannot run these
+      # models, so it must never be selected.
+      # NOTE: do not use Docker's `--gpus device=N` / device_ids here; on this
+      # Docker Desktop host its ordinal does not match the CUDA ordinal and it
+      # resolves to the Quadro. Selection is done through CUDA_VISIBLE_DEVICES.
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "${GPU_DEVICE_INDEX:-1}"
+      # The engine may take most of the card: it is put to sleep (weights
+      # offloaded to CPU, KV cache released) before the audio model runs, so
+      # vision and audio never need to be resident at the same time. The 4-bit
+      # weights are ~7.5 GB and the vision encoder cache needs headroom, so a
+      # small budget such as 0.45 leaves no room for the KV cache.
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.80}
+      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      VLLM_MM_MAX_PIXELS: ${VLLM_MM_MAX_PIXELS:-200704}
+      VLLM_MM_NFRAMES: ${VLLM_MM_NFRAMES:-8}
+      # Seconds without an API request before the engine is parked and its VRAM
+      # released for other containers (0 disables idling).
+      VLLM_IDLE_SLEEP_SECONDS: ${VLLM_IDLE_SLEEP_SECONDS:-60}
+      MAX_CRUCIAL_FRAMES: ${MAX_CRUCIAL_FRAMES:-6}
+      CRUCIAL_FRAME_SCORE_THRESHOLD: ${CRUCIAL_FRAME_SCORE_THRESHOLD:-0.08}
+      CRUCIAL_FRAME_MIN_GAP_SECONDS: ${CRUCIAL_FRAME_MIN_GAP_SECONDS:-0.75}
+      REPORTS_DIR: /app/reports
+      REPORTS_HOST_PATH: ${REPORTS_HOST_PATH:-/home/demo/projects/activity_recog_v2/reports}
+      RUNTIME_CONFIG_PATH: /app/config/runtime.json
+      # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
+      # On this WSL2 + Blackwell host it makes every CUDA allocation fail with
+      # "RuntimeError: CUDA driver error: unknown error", so the vLLM engine
+      # cannot start. It was harmless on the older manual container because the
+      # variable was simply never set there.
+      HF_HUB_OFFLINE: "0"
+      MAX_VIDEO_FRAMES: ${MAX_VIDEO_FRAMES:-24}
+      FRAME_INTERVAL_SECONDS: ${FRAME_INTERVAL_SECONDS:-2}
+      ENABLE_AUDIO_ANALYSIS: ${ENABLE_AUDIO_ANALYSIS:-0}
+      DB_NAME: ${DB_NAME:-isquare}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-5432}
+      # SFTP delivery for the DB-driven /detect-objects mode: annotated artefacts
+      # are published to the shared file server and their URL is recorded in
+      # media_analysis.output_file_path. Left empty the mode returns 502.
+      SFTP_HOST: ${SFTP_HOST:-}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USER: ${SFTP_USER:-}
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/app/secrets/id_ed25519}
+      SFTP_REMOTE_DIR: ${SFTP_REMOTE_DIR:-}
+      OUTPUT_PUBLIC_BASE: ${OUTPUT_PUBLIC_BASE:-}
+      OUTPUT_PUBLIC_PATH: ${OUTPUT_PUBLIC_PATH:-/media_analytics/output}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "2gb"
+    volumes:
+      - huggingface-cache:/models/huggingface
+      - ./reports:/app/reports
+      - ./config:/app/config
+      # Read-only mount of the sample clips used for end-to-end activity tests.
+      # Kept out of the image so testers can point it at any folder.
+      - ${TEST_VIDEOS_DIR:-C:/Users/Hp/projects/activity_videos_for_testing}:/testvideos:ro
+      # Private key for SFTP delivery, kept out of the image (see .dockerignore).
+      - ./secrets:/app/secrets:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # Attach every host GPU; the single-GPU pinning happens in
+            # CUDA_VISIBLE_DEVICES above. `count: 1` would hand the container
+            # whichever card Docker enumerates first (the Quadro here).
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    stop_grace_period: 60s
+volumes:
+  huggingface-cache:
