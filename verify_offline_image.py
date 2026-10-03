@@ -1,7 +1,7 @@
 """Verify the offline image actually contains every model and library.
 
 Run inside the built image (no GPU needed):
-    docker run --rm --entrypoint python activity-recognition:2.0.0 /app/deploy/verify_offline_image.py
+    docker run --rm --entrypoint python activity-recognition:2.0.0 /app/verify_offline_image.py
 
 Checks, in order:
   1. the heavy libraries import (torch, transformers, vllm, faster_whisper)

@@ -1,0 +1,422 @@
+[
+{
+"path": ".dockerignore",
+"size": 106,
+"md5": "f7f74fd1a5833f95c4669effe982ca1a"
+},
+{
+"path": ".dockerignore.bak-queue",
+"size": 90,
+"md5": "569e5e49b19307c9650bdce4b2995c37"
+},
+{
+"path": ".env",
+"size": 1371,
+"md5": "4b0cbbe2acd4c7a5a78eef495a3fd8b5"
+},
+{
+"path": ".env.bak-before-db-config",
+"size": 887,
+"md5": "287ba9fd1ffa19206766e16397a29305"
+},
+{
+"path": ".env.example",
+"size": 1735,
+"md5": "0e3da39020f9ed1478de786265a562bf"
+},
+{
+"path": ".env.new-host",
+"size": 398,
+"md5": "511d08e6eb1b4c5ad982c4f738207f58"
+},
+{
+"path": "app.py",
+"size": 84546,
+"md5": "56d9db91ea6b10f64a20a7c8d46791f7"
+},
+{
+"path": "app.py.bak-conclusion",
+"size": 64143,
+"md5": "c734b8a0c0651bbce1e40750b6ae454f"
+},
+{
+"path": "app.py.bak-db",
+"size": 43603,
+"md5": "4e9c1d83f96c8d8a2e3bff5d5510ef02"
+},
+{
+"path": "app.py.bak-queue",
+"size": 51123,
+"md5": "89e26d9ff24518c0e96012841bb9d547"
+},
+{
+"path": "applog.txt",
+"size": 119515,
+"md5": "97916af3e489df8a0f3c963b0a9827dd"
+},
+{
+"path": "applog2.txt",
+"size": 40971,
+"md5": "b6bf3b47c34766f531d022286ccf684b"
+},
+{
+"path": "audio_analysis.py",
+"size": 42929,
+"md5": "a113ef4aafc67e1ca8edd96791c725bb"
+},
+{
+"path": "audio_analysis.py.bak-before-speech-20261002-144800",
+"size": 29685,
+"md5": "15a8efff6e0db9905ec7f4f464de4887"
+},
+{
+"path": "build_log.txt",
+"size": 5108,
+"md5": "c3a452e2ccfeb99a43ae6b16bf38e1a7"
+},
+{
+"path": "dashboard.html",
+"size": 51526,
+"md5": "00ec76feb111e91710cc758d10b55b03"
+},
+{
+"path": "dedupe_hf_cache.sh",
+"size": 1216,
+"md5": "a91e483e2a367306d7a1ad94c9edc7c0"
+},
+{
+"path": "docker-compose.devtest.yml",
+"size": 275,
+"md5": "ebff062e2403f6e0eb93a5a5afd9aa20"
+},
+{
+"path": "docker-compose.yml",
+"size": 6575,
+"md5": "17d542a8ff2b31a0293e40f996d50b05"
+},
+{
+"path": "docker-compose.yml.bak-db",
+"size": 4382,
+"md5": "3233556f36c6394b28a9103407af92d4"
+},
+{
+"path": "docker-compose.yml.bak-queue",
+"size": 5075,
+"md5": "9373a448da5333ae9cd3d99066268c12"
+},
+{
+"path": "Dockerfile",
+"size": 4399,
+"md5": "a7393fed81b555a9e205385741de13f7"
+},
+{
+"path": "Dockerfile.bak-db",
+"size": 2843,
+"md5": "61f21a1bcc0c4b50acca00b3136c83b7"
+},
+{
+"path": "Dockerfile.bak-queue",
+"size": 3210,
+"md5": "963a7f98f3c1ba5e1f6ebeb2e017eed7"
+},
+{
+"path": "e2e_batch.sh",
+"size": 746,
+"md5": "582187b2b63c7155feaf2e5b41a1ff29"
+},
+{
+"path": "e2e_probe.py",
+"size": 2069,
+"md5": "d52c90815c10290caf1e583e60e1f868"
+},
+{
+"path": "e2e_summary.py",
+"size": 2017,
+"md5": "e582112c64887eb4ff950b85dd3d9399"
+},
+{
+"path": "engine_power.py",
+"size": 5049,
+"md5": "783b2ca3b12337a1fedb6d9790380a99"
+},
+{
+"path": "entrypoint.sh",
+"size": 3060,
+"md5": "50823ef40f80c0d27cf5b2fc69663e1b"
+},
+{
+"path": "frame_probe.py",
+"size": 3102,
+"md5": "1e81d662ce545c43c13dd9a489f91a08"
+},
+{
+"path": "img_probe.py",
+"size": 2075,
+"md5": "77e65217116a9a4b35c4c13ca77f9c17"
+},
+{
+"path": "job_queue.py",
+"size": 31937,
+"md5": "da57c861fe367d4d9023a11e086b7402"
+},
+{
+"path": "media_utils.py",
+"size": 22680,
+"md5": "829233c0d2170e6caae60e66e7f35868"
+},
+{
+"path": "object_detect_model_09_may_2026.pt",
+"size": 5476954,
+"md5": "24d5c5f65d4f33fc3550c1548cb93303"
+},
+{
+"path": "object_detect_model_256_class.pt",
+"size": 5687770,
+"md5": "03fd0a00888a10b818c257dee0c94f30"
+},
+{
+"path": "OPERATIONS.md",
+"size": 8424,
+"md5": "f73ce0e8eee8cc2338182038a39c2927"
+},
+{
+"path": "pdf_report.py",
+"size": 21111,
+"md5": "666573b69de67d84b84c38ba394ff4fe"
+},
+{
+"path": "probe_detect_path.py",
+"size": 802,
+"md5": "beec39bbe433d2c21c92d002f4cf0361"
+},
+{
+"path": "probe_zero.py",
+"size": 1031,
+"md5": "6156dc7996c830c9669e8a49b67c77a9"
+},
+{
+"path": "requirements.txt",
+"size": 641,
+"md5": "8eba4b19c4986360c07911ad5dcc0398"
+},
+{
+"path": "response_schema.py",
+"size": 14079,
+"md5": "bcb0d77cc13b40610e409d976e3777c7"
+},
+{
+"path": "response_schema.py.bak-conclusion",
+"size": 13875,
+"md5": "d22d7117f3a4dc6e58e5d07fc771fee6"
+},
+{
+"path": "RESUME_RUNBOOK.md",
+"size": 7272,
+"md5": "14014b5135522859ce13c2bd38d29177"
+},
+{
+"path": "sftp_upload.py",
+"size": 5208,
+"md5": "15e338763a3b28e1e62918ccb4439d49"
+},
+{
+"path": "smoke_container_audio.py",
+"size": 3006,
+"md5": "2771cad232582e585c3eecea776d5675"
+},
+{
+"path": "stream_tar.cmd",
+"size": 444,
+"md5": "963aa3003a1cf4bfbd90c68fb83f4ab4"
+},
+{
+"path": "swagger_docs.py",
+"size": 12463,
+"md5": "d815416762308116f999c2bc7a4d2145"
+},
+{
+"path": "swagger_docs.py.bak-queue",
+"size": 4555,
+"md5": "61e1ea03cefc33f81823062c7c33a677"
+},
+{
+"path": "test_audio_analysis.py",
+"size": 13063,
+"md5": "00602019a10cdda633ac8bf7299d6d92"
+},
+{
+"path": "test_audio_analysis.py.bak-before-speech-20261002-144800",
+"size": 11123,
+"md5": "93a6fba19f1a863cf04f15924b9b7007"
+},
+{
+"path": "test_docker_integration.py",
+"size": 2153,
+"md5": "5188a18a5df36e9cb8686a271d0d7972"
+},
+{
+"path": "test_engine_power.py",
+"size": 3204,
+"md5": "653c2529884ca743fc3cce22e597e12f"
+},
+{
+"path": "test_image_real.jpg",
+"size": 25121,
+"md5": "748b23c656fef716090c8d6004335a62"
+},
+{
+"path": "test_job_queue.py",
+"size": 30389,
+"md5": "7d1f24349917416bc5109338e72e9124"
+},
+{
+"path": "test_media_utils.py",
+"size": 8157,
+"md5": "590fcfa3901bc71db8c957497cb0ec4e"
+},
+{
+"path": "test_pdf_report.py",
+"size": 5915,
+"md5": "a42cafb60efa85486a13db83e3d464a5"
+},
+{
+"path": "test_removed_models.py",
+"size": 2024,
+"md5": "3079c1588320752d285c89cca15edec2"
+},
+{
+"path": "test_response_schema.py",
+"size": 7807,
+"md5": "9b676647a30a91b7f28fc6cbef08c5dd"
+},
+{
+"path": "test_swagger_docs.py",
+"size": 8344,
+"md5": "d270e972e215207a27eb759d03dd1c5d"
+},
+{
+"path": "test_vision_backend_vllm.py",
+"size": 4102,
+"md5": "f6d202f00110ef531ea9e54b78852785"
+},
+{
+"path": "test_vllm_pipeline.py",
+"size": 4224,
+"md5": "b72dd1f297bae2b8ffc4c0dbc85362b0"
+},
+{
+"path": "verify_offline_image.py",
+"size": 4418,
+"md5": "0fb6eddbfb410276fb6dd9efae602ad5"
+},
+{
+"path": "vision_backend.py",
+"size": 7309,
+"md5": "271e067c67c85c864c721cff47107d7a"
+},
+{
+"path": "vllm_video_pipeline.py",
+"size": 8232,
+"md5": "2e5d403c5daa4e0dd6b7850f3c946a55"
+},
+{
+"path": "_e2e_elint.json",
+"size": 19847,
+"md5": "c1863953a7c4b19f374732e301eb8590"
+},
+{
+"path": "_hash_tree.py",
+"size": 1158,
+"md5": "6707a9a2dcdfa738154203b7ea181656"
+},
+{
+"path": "_kill_stream.ps1",
+"size": 382,
+"md5": "b4fdd0a49f2550ea9430ce245789394e"
+},
+{
+"path": "_probe_export.ps1",
+"size": 341,
+"md5": "2068ce67db7b6c047315e8f724fa57a0"
+},
+{
+"path": ".docker-anonymous/config.json",
+"size": 98,
+"md5": "a3aef6b85c518780dc4abc2d41d3e6ef"
+},
+{
+"path": ".docker-codex/config.json",
+"size": 4,
+"md5": "c443b04d0fc26b0a5a4573a78e0082a1"
+},
+{
+"path": "config/runtime.json",
+"size": 888,
+"md5": "06b051e12140cc1ce020eb6658711826"
+},
+{
+"path": "deploy/.env.ubuntu",
+"size": 2097,
+"md5": "8c0453a1a1c206b6d9024a0bd83cc1f2"
+},
+{
+"path": "deploy/build_offline_image.ps1",
+"size": 3410,
+"md5": "45c06800e8a1efbe8efaff2d51346964"
+},
+{
+"path": "deploy/deploy_ubuntu.sh",
+"size": 8857,
+"md5": "8f39f6bfaeb8d983f7c9e3e3b09810c3"
+},
+{
+"path": "deploy/docker-compose.ubuntu.yml",
+"size": 698,
+"md5": "b344ca72702ebd4f1c2966d4468cf161"
+},
+{
+"path": "deploy/docker-compose.yml",
+"size": 6575,
+"md5": "17d542a8ff2b31a0293e40f996d50b05"
+},
+{
+"path": "deploy/entrypoint.sh",
+"size": 3060,
+"md5": "50823ef40f80c0d27cf5b2fc69663e1b"
+},
+{
+"path": "deploy/prefetch_models.py",
+"size": 1860,
+"md5": "7627bbff7dfbf7986ad0695974c94da0"
+},
+{
+"path": "deploy/transfer_image.ps1",
+"size": 3150,
+"md5": "5486837b314ccf7086016d253eba3e4a"
+},
+{
+"path": "deploy/UBUNTU_DEPLOY.md",
+"size": 7478,
+"md5": "1870b904c79f9ccf72e1f2251eaa8f8e"
+},
+{
+"path": "deploy/verify_offline_image.py",
+"size": 4425,
+"md5": "85085cdb7199a17531edf88f9d78529a"
+},
+{
+"path": "secrets/id_ed25519",
+"size": 400,
+"md5": "9396002645d5c30a72468fd918967af2"
+},
+{
+"path": "templates/dashboard.html",
+"size": 54763,
+"md5": "025b8130656208e180cb2a2b63d1d313"
+},
+{
+"path": "templates/dashboard.html.bak-queue",
+"size": 11737,
+"md5": "57ce6640f492fb51f6faed4ee36dd04b"
+}
+]

@@ -1,0 +1,66 @@
+"""OpenAPI operation documents kept separate from request handlers."""
+
+from response_schema import (DETAILED_VIDEO_ANALYSIS_ENVELOPE_SCHEMA, IMAGE_ANALYSIS_ENVELOPE_SCHEMA,
+    VIDEO_ANALYSIS_ENVELOPE_SCHEMA)
+
+ERROR = {"type": "object", "properties": {"error": {"type": "string"}}}
+
+HEALTH_SWAGGER_DOC = {
+    "tags": ["Health"], "summary": "Service liveness and backend state",
+    "responses": {"200": {"description": "Service is accepting requests"},
+                  "503": {"description": "Service is unavailable", "schema": ERROR}},
+}
+GET_VISION_BACKEND_SWAGGER_DOC = {
+    "tags": ["Backend"], "summary": "Get the active vision and audio models",
+    "responses": {"200": {"description": "Backend state", "schema": {"type": "object", "properties": {
+        "vision_backend": {"type": "string"}, "vision_model": {"type": "string"},
+        "audio_model": {"type": "string"},
+        "available_backends": {"type": "array", "items": {"type": "string"}}}}}},
+}
+SET_VISION_BACKEND_SWAGGER_DOC = {
+    "tags": ["Backend"], "summary": "Set the primary vision backend",
+    "parameters": [{"name": "body", "in": "body", "required": True, "schema": {"type": "object",
+        "required": ["backend"], "properties": {"backend": {"type": "string", "enum": ["vllm"]}}}}],
+    "responses": {"200": {"description": "Backend activated"}, "400": {"description": "Invalid backend", "schema": ERROR},
+                  "502": {"description": "Backend could not be loaded", "schema": ERROR}},
+}
+
+def upload_doc(media):
+    return {"tags": ["Media Analysis"], "summary": f"Analyze an uploaded {media}", "consumes": ["multipart/form-data"],
+        "parameters": [{"name": "file", "in": "formData", "type": "file", "required": True}],
+        "responses": {"200": {"description": "Analysis completed"}, "400": {"description": f"Invalid {media}", "schema": ERROR},
+                      "413": {"description": "Upload or video exceeds limits", "schema": ERROR},
+                      "502": {"description": "Inference failed", "schema": ERROR}}}
+
+ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC = upload_doc("image")
+ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC = upload_doc("video")
+ANALYZE_VIDEO_DETAILED_SWAGGER_DOC = upload_doc("video with temporal classification, object tracking, and audio")
+# Attach the enforced response schema so the contract is visible in Swagger.
+ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC["responses"]["200"]["schema"] = IMAGE_ANALYSIS_ENVELOPE_SCHEMA
+ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC["responses"]["200"]["schema"] = VIDEO_ANALYSIS_ENVELOPE_SCHEMA
+ANALYZE_VIDEO_DETAILED_SWAGGER_DOC["responses"]["200"]["schema"] = DETAILED_VIDEO_ANALYSIS_ENVELOPE_SCHEMA
+FETCH_MEDIA_SWAGGER_DOC = {
+    "tags": ["Media Analysis"], "summary": "Analyze media referenced by a database record",
+    "parameters": [{"name": "body", "in": "body", "required": True, "schema": {"type": "object", "required": ["id"],
+        "properties": {"id": {"type": "integer"}}}}],
+    "responses": {"200": {"description": "Analysis completed"}, "400": {"description": "Invalid request", "schema": ERROR},
+                  "413": {"description": "Media exceeds limits", "schema": ERROR}, "502": {"description": "Inference failed", "schema": ERROR}},
+}
+DETECT_OBJECTS_SWAGGER_DOC = {
+    "tags": ["Object Detection"], "summary": "Detect objects in an uploaded image",
+    "consumes": ["multipart/form-data"],
+    "parameters": [{"name": "file", "in": "formData", "type": "file", "required": True}],
+    "responses": {"200": {"description": "Detection completed"}, "400": {"description": "Invalid image", "schema": ERROR},
+                  "413": {"description": "Upload exceeds limit", "schema": ERROR}, "502": {"description": "Detector failed", "schema": ERROR}},
+}
+DOWNLOAD_REPORT_SWAGGER_DOC = {
+    "tags": ["Reports"], "summary": "Download a generated detailed-analysis PDF",
+    "parameters": [{"name":"filename","in":"path","required":True,"type":"string"}],
+    "produces": ["application/pdf"],
+    "responses": {"200":{"description":"PDF report"},"404":{"description":"Report not found","schema":ERROR}},
+}
+GET_CONFIG_SWAGGER_DOC = {"tags":["Configuration"],"summary":"Get persisted inference configuration",
+    "responses":{"200":{"description":"Current configuration"}}}
+SET_CONFIG_SWAGGER_DOC = {"tags":["Configuration"],"summary":"Validate, apply, and persist inference configuration",
+    "parameters":[{"name":"body","in":"body","required":True,"schema":{"type":"object"}}],
+    "responses":{"200":{"description":"Configuration saved"},"400":{"description":"Invalid setting","schema":ERROR}}}
