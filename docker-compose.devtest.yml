@@ -1,0 +1,8 @@
+services:
+  activity-recognition:
+    volumes: !override
+      - ./reports:/app/reports
+      - ./config:/app/config
+      - activity-data:/app/data
+      - ${TEST_VIDEOS_DIR:-C:/Users/Hp/projects/activity_videos_for_testing}:/testvideos:ro
+      - ./secrets:/app/secrets:ro

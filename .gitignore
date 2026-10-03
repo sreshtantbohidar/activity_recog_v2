@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Secrets / env files (only the clean template ships)
+.env
+.env.ubuntu
+.env.*
+!.env.example
+
+# Large binaries / media / model weights - never in git
+*.mp4
+*.avi
+*.mkv
+*.tar
+*.tar.gz
+*.tgz
+hf_models/
+testvideos/
+segments/
+reports/
+logs/
+
+# Logs & scratch output
+*.log
+applog*.txt
+
+# Stale duplicate deploy copy (deploy/ is canonical)
+ubuntu/
