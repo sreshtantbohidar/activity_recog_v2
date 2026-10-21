@@ -95,8 +95,8 @@ definitions.
 
 ## Dashboard
 
-The dashboard at `http://localhost:5009/` has a tab per analysis mode. Each tab
-renders the analytics payload visually by type — KPI tiles, tables, chips,
+The dashboard at `http://localhost:5009/` has a tab per upload mode; detailed video
+analysis has no tab and runs through the API only. Each tab renders the analytics payload visually by type — KPI tiles, tables, chips,
 figures and a progress bar — with the raw JSON in a collapsible section beneath.
 The **Queue** tab shows queue depth and a paginated table of jobs (status,
 progress, input, timings, HTTP status, error) with a JSON viewer and per-row
