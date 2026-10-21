@@ -1365,7 +1365,7 @@ def health_components():
 _UNIT_TEST_LOCK = threading.Lock()
 _UNIT_TEST_MODULES = ("test_audio_analysis", "test_job_queue", "test_media_utils",
     "test_engine_power", "test_vram_gate", "test_gpu_monitor", "test_vision_backend_vllm",
-    "test_response_schema", "test_video_object_detection",
+    "test_response_schema", "test_video_object_detection", "test_feature_guard",
     "test_swagger_docs")
 
 

@@ -162,6 +162,32 @@ docker compose logs --tail=100 activity-recognition
 
 Image and video requests can be exercised from the dashboard. The integration suite verifies `/health`, `/`, and every documented Swagger operation against the running container.
 
+## Deploying changes safely
+
+Deploy by rebuilding the image, never by copying source into a running container:
+
+```sh
+python3 -m unittest test_feature_guard -v
+docker compose up --build -d
+python3 verify_deployment.py --url http://127.0.0.1:5009
+```
+
+`docker cp` leaves the image behind, so the next `docker compose up` or a container recreate
+silently reverts to the old files. That is how the Monitor tab and the idle engine recycle
+disappeared on 2026-10-17: the container stayed healthy, so nothing reported the loss.
+`verify_deployment.py` now fails a deploy when `/gpu/monitor`, the Monitor tab or the
+video-detection routes are missing from the running service.
+
+The source is under git, so a clean `git status` is part of the deploy. If a file is ever
+overwritten again, restore the last known-good baseline with:
+
+```sh
+git checkout -- .
+```
+
+A portable copy of that baseline is kept outside the tree:
+`/home/demo/activity-recog-v2-baseline.bundle` (`git clone <bundle> <dir>`).
+
 ## Performance controls
 
 - `MAX_VIDEO_FRAMES` bounds expensive VLM calls (default 24).
