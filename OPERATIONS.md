@@ -48,6 +48,16 @@ is waiting for another container to release the card. The vision endpoints
 (`/analyze-image`, `/analyze-video`, `/analyze-video-detailed`) answer `502`
 until the supervised engine is up, and `/health` plus the Monitor screen say so.
 
+## Replacing the object-detection model
+
+The YOLO checkpoint is data, not code. `./models` is mounted read-only at
+`/app/models`, and `OBJECT_MODEL_PATH` selects the file the detector loads; class
+names come from the checkpoint, so a model with different labels needs nothing
+else. Drop the new `.pt` in `./models`, point `OBJECT_MODEL_PATH` at it (`.env`
+or the compose environment) and recreate the container — no rebuild, no code
+change. Unset, it keeps the checkpoint baked into the image. See
+`models/README.md`.
+
 ## GPU inference is required
 
 The API returns unavailable/backend errors when CUDA is not exposed to the container; it never silently performs model inference on CPU. Media decoding, preprocessing, HTTP handling and transfers into VRAM still require bounded CPU and system RAM.

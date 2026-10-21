@@ -152,11 +152,19 @@ docker compose exec activity-recognition python -m unittest discover -v
 ```
 
 `test_job_queue.py` covers the queue in isolation. `test_swagger_docs.py`,
-`test_response_schema.py` and `test_removed_models.py` are static. The
-`test_queue_e2e.py`, `test_queue_actions.py` and `test_docker_integration.py`
-suites need a **running service** — set `BASE` in those files (or edit the
-`BASE` constant) to point at it, and note that they exercise real GPU inference,
-so a full run takes minutes per endpoint.
+`test_response_schema.py` and `test_removed_models.py` are static.
+
+`e2e_live.py` is the end-to-end check and needs a **running service**: it
+submits image and video object detection (including an AV1 upload), follows the
+jobs through the queue, downloads the annotated clip and asks for a byte range,
+round-trips a config value, exercises reload/cancel/delete and confirms the
+analysis endpoints report a missing engine. It asserts real outcomes, not
+status codes. Point it at a deployment with `E2E_BASE` and a fixture folder with
+`E2E_FIXTURES` (a 640x360 frame, a 1280x720 frame and an AV1 clip):
+
+```sh
+python3 e2e_live.py            # 19 checks against http://127.0.0.1:5009
+```
 
 `check_analytics.py`, `make_harness.py` and `run_harness.py` are development
 helpers: the first captures one real response per endpoint from a live service,

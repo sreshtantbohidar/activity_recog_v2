@@ -1,6 +1,5 @@
-# Ubuntu/Linux override. It removes the Windows paths and the Hugging Face named
-# volume from the base file. That volume must not be mounted on an offline image:
-# an empty volume hides the model files baked into the image.
+# Ubuntu/Linux override. An empty Hugging Face volume would hide models baked
+# into the offline image, so the Linux mount list deliberately omits it.
 services:
   activity-recognition:
     image: activity-recognition:2.0.0
@@ -16,7 +15,10 @@ services:
       QWEN_AUDIO_MODEL_ID: /app/hf_models/Qwen2.5-Omni-3B
       WHISPER_MODEL_ID: /app/whisper_models/faster-whisper-large-v3
       WHISPER_DOWNLOAD_ROOT: /app/whisper_models
-      OBJECT_MODEL_PATH: /app/object_detect_model_256_class.pt
+      # Path to the YOLO weights. Point this at a file in ./models (mounted
+      # read-only at /app/models) to swap the detector without rebuilding
+      # the image or touching the code; class names come from the .pt.
+      OBJECT_MODEL_PATH: ${OBJECT_MODEL_PATH:-/app/object_detect_model_256_class.pt}
       REPORTS_HOST_PATH: /app/reports
     volumes: !override
       - ./reports:/app/reports
@@ -24,3 +26,5 @@ services:
       - activity-data:/app/data
       - ${TEST_VIDEOS_DIR:-./testvideos}:/testvideos:ro
       - ./secrets:/app/secrets:ro
+      # Detector weights: drop a .pt here and point OBJECT_MODEL_PATH at it.
+      - ./models:/app/models:ro
