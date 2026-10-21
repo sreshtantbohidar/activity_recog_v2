@@ -176,12 +176,20 @@ def percentage(part: int, whole: Optional[int]) -> float:
     return round(part * 100.0 / whole, 1)
 
 
-def evaluate(device: dict, processes: Iterable[dict], utilization: float) -> dict:
+def evaluate(device: dict, processes: Iterable[dict], utilization: float,
+             engine: Optional[dict] = None) -> dict:
     """Decide whether the service can still run on this card.
 
     The engine is the constraint: it needs ``utilization`` of the device total
     *in addition to* whatever other processes hold, so what matters is how much
     the card would have if our own processes released it.
+
+    ``engine`` is the engine's own state (``{"reachable": bool, "sleeping":
+    bool|None}``) when the caller can ask it, and None when it cannot. It
+    changes what the alert means, not the arithmetic: an engine that is awake
+    and serving is not a failure, so the same shortfall is reported as a
+    restart risk instead of "not enough VRAM to run". Only a parked or absent
+    engine makes the budget check a live blocker.
     """
     processes = list(processes)
     total = device["total_mib"]
@@ -194,10 +202,32 @@ def evaluate(device: dict, processes: Iterable[dict], utilization: float) -> dic
     required = int(total * float(utilization))
     margin = available - required
 
-    if available < required:
+    state = engine or {}
+    known = engine is not None
+    reachable = bool(state.get("reachable"))
+    sleeping = state.get("sleeping")
+    running = reachable and sleeping is False
+    parked = reachable and sleeping is True
+
+    if running:
+        # The engine is up and holding its budget, so the card is in a valid
+        # state whatever the numbers say: what a start would need is a risk to
+        # plan around, not an outage to report in red.
+        status = OK
+        detail = (f"Engine is running: {device['used_mib']} MiB of {total} MiB is in use "
+                  f"({percentage(device['used_mib'], total)}%) and other processes hold "
+                  f"{others_used} MiB. A restart would need {required} MiB and {available} MiB "
+                  f"would be free ({margin} MiB spare).")
+        if available < required:
+            detail = (f"Engine is running: {device['used_mib']} MiB of {total} MiB is in use "
+                      f"({percentage(device['used_mib'], total)}%) and other processes hold "
+                      f"{others_used} MiB. It could not start again until the card is freed: a "
+                      f"restart needs {required} MiB against {available} MiB free.")
+    elif available < required:
         status = CRITICAL
-        detail = (f"Not enough VRAM to run the activity app: the engine needs {required} MiB and only "
-                  f"{available} MiB is available - other processes hold {others_used} MiB.")
+        detail = (f"Not enough VRAM to {'wake the parked engine' if parked else 'run the activity app'}: "
+                  f"the engine needs {required} MiB and only {available} MiB is available - other "
+                  f"processes hold {others_used} MiB.")
     elif margin < THIN_MARGIN_MIB:
         status = WARNING
         detail = (f"Tight VRAM: {available} MiB available against the engine's {required} MiB - only "
@@ -209,6 +239,9 @@ def evaluate(device: dict, processes: Iterable[dict], utilization: float) -> dic
     return {"ok": status == OK, "status": status, "detail": detail, "required_mib": required,
             "available_mib": available, "shortfall_mib": max(0, required - available),
             "margin_mib": margin, "others_used_mib": others_used, "unattributed_mib": unattributed,
+            "engine_reachable": reachable if known else None, "engine_sleeping": sleeping,
+            "engine_running": bool(running) if known else None,
+            "restart_ok": available >= required,
             "audio_stage_mib": AUDIO_STAGE_MIB, "audio_ok": available >= AUDIO_STAGE_MIB}
 
 
@@ -216,8 +249,13 @@ def build_snapshot(utilization: float = DEFAULT_UTILIZATION, *,
                    device_reader: Callable[[], Optional[dict]] = read_device,
                    process_reader: Callable[[], list[dict]] = read_processes,
                    owner_check: Callable[[int], bool] = is_app_process,
+                   engine_reader: Optional[Callable[[], Optional[dict]]] = None,
                    clock: Callable[[], float] = time.time) -> dict:
-    """One monitor frame: device, per-process usage, and the resource verdict."""
+    """One monitor frame: device, per-process usage, and the resource verdict.
+
+    ``engine_reader`` reports whether the engine is up and awake; without it the
+    frame can only judge the budget, not whether the service is actually down.
+    """
     device = device_reader()
     if not device:
         return {"timestamp": datetime.fromtimestamp(clock(), timezone.utc).isoformat(timespec="seconds"),
@@ -225,6 +263,7 @@ def build_snapshot(utilization: float = DEFAULT_UTILIZATION, *,
                 "device": None, "processes": [],
                 "resource": {"ok": False, "status": WARNING, "detail": "GPU memory usage is unavailable",
                              "required_mib": None, "available_mib": None, "shortfall_mib": None,
+                             "engine_running": None, "engine_reachable": None, "restart_ok": None,
                              "audio_ok": None}}
     total = device["total_mib"]
     processes = []
@@ -237,7 +276,14 @@ def build_snapshot(utilization: float = DEFAULT_UTILIZATION, *,
     device = dict(device)
     device["used_percent"] = percentage(device["used_mib"], total)
     device["free_percent"] = percentage(max(0, total - device["used_mib"]), total)
-    resource = evaluate(device, processes, utilization)
+    engine = None
+    if engine_reader is not None:
+        try:
+            engine = engine_reader()
+        except Exception:
+            # The verdict must not fail because the engine could not be asked.
+            engine = None
+    resource = evaluate(device, processes, utilization, engine)
     resource["utilization"] = float(utilization)
     resource["required_percent"] = percentage(resource["required_mib"] or 0, total)
     return {"timestamp": datetime.fromtimestamp(clock(), timezone.utc).isoformat(timespec="seconds"),

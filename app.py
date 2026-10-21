@@ -277,6 +277,59 @@ def _prune_object_videos(directory: Path, keep: int | None = None) -> None:
         # completed detection into a failed job.
         logger.warning("Could not prune annotated video clips in %s", directory, exc_info=True)
 
+# Codecs both bundled decoders (OpenCV's FFmpeg and decord) can read. AV1 is
+# the notable gap: the container opens it but fails on the first frame with
+# "Failed to get pixel format", which surfaced as "no decodable frames".
+SUPPORTED_VIDEO_CODECS = {"h264", "hevc"}
+
+def _video_codec(path) -> str:
+    """First video stream's codec name, or "" when ffprobe cannot read it."""
+    try:
+        completed = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30, check=False)
+    except Exception:
+        return ""
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return ""
+    return completed.stdout.strip().splitlines()[0].strip().lower()
+
+def _ensure_decodable_video(path):
+    """Convert an undecodable video to H.264 in place, before any frame work.
+
+    The image's ffmpeg has libdav1d but its OpenCV and decord builds do not, so
+    an AV1 upload passes duration validation and then fails on the first frame.
+    Converting once, atomically, keeps every stage (frame sampling, tracking,
+    annotation, audio) on the same decodable file and makes replays free. Audio
+    is kept as AAC because /analyze-video analyses it.
+    """
+    path = Path(path)
+    codec = _video_codec(path)
+    if codec in SUPPORTED_VIDEO_CODECS:
+        return codec
+    target = path.with_name(f"{path.stem}_decoded{path.suffix}")
+    report_progress(2, f"converting {codec or 'unsupported'} video")
+    try:
+        completed = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y",
+            "-i", str(path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", str(target)],
+            text=True, capture_output=True, timeout=1800, check=False)
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        raise MediaProbeError(
+            f"Video codec '{codec or 'unknown'}' is not supported and could not be converted: {exc}")
+    if completed.returncode != 0 or not target.exists() or target.stat().st_size == 0:
+        detail = (completed.stderr or completed.stdout or "ffmpeg produced no output").strip()
+        target.unlink(missing_ok=True)
+        raise MediaProbeError(
+            f"Video codec '{codec or 'unknown'}' is not supported and could not be converted: "
+            f"{detail[-300:]}")
+    os.replace(target, path)
+    logger.info("Converted %s video to h264 for %s", codec or "unknown", path.name)
+    report_progress(4, "video prepared")
+    return "h264"
+
 class ObjectDetector:
     """Lazy YOLO owner; keeps weights resident and avoids slowing API startup."""
     def __init__(self):
@@ -332,6 +385,7 @@ class ObjectDetector:
         sample of per-frame detections is returned; every frame is still
         annotated, and the queue response stays small enough for SQLite.
         """
+        _ensure_decodable_video(source_path)
         directory = object_video_dir()
         directory.mkdir(parents=True, exist_ok=True)
         artifact = directory/f"detected_{uuid.uuid4().hex}.mp4"
@@ -415,6 +469,7 @@ class ObjectDetector:
         (MAX_VIDEO_DURATION_SECONDS, 5 minutes) before calling, so the bound on
         this work is video length in seconds rather than a frame count.
         """
+        _ensure_decodable_video(source_path)
         import cv2
         capture = cv2.VideoCapture(str(source_path))
         if not capture.isOpened(): raise MediaProbeError("Video contains no decodable frames")
@@ -786,6 +841,7 @@ def _build_conclusion_summary(metadata, frames, audio, dominant, basis, confiden
 
 def analyze_video_file(path):
     metadata = validate_video_duration(path, float(os.getenv("MAX_VIDEO_DURATION_SECONDS", str(MAX_VIDEO_DURATION_SECONDS))))
+    _ensure_decodable_video(path)
     report_progress(5, "probing media")
     paths, timestamps = sample_video_frames(path); results, backends = [], set()
     frame_warnings = []
@@ -921,6 +977,7 @@ def analyze_video_detailed_file(path, original_filename=None):
     """Run all video modalities serially to keep GPU memory predictable."""
     with _detailed_video_lock:
         metadata = validate_video_duration(path, float(os.getenv("MAX_VIDEO_DURATION_SECONDS", str(MAX_VIDEO_DURATION_SECONDS))))
+        _ensure_decodable_video(path)
         report_progress(4, "probing media")
         paths, timestamps, selections, change_scores = sample_detailed_video_frames(path)
         frames, backends = [], set()
@@ -1428,6 +1485,19 @@ def unit_tests():
     return jsonify(payload), 200 if result.wasSuccessful() else 500
 
 
+def _engine_state() -> dict:
+    """Whether the engine answers, and whether its weights are resident.
+
+    The Monitor has to tell "the engine is serving" from "the engine would have
+    to start": the budget arithmetic is the same, but only the second is an
+    outage. Asking the engine costs two short local HTTP calls and never wakes
+    it (sleep/wake state is not an inference request).
+    """
+    status = check_vllm_server(host=VLLM_VISION_HOST, model=VLLM_VISION_MODEL, timeout=1.5)
+    if not status.get("reachable"):
+        return {"reachable": False, "sleeping": None}
+    return {"reachable": True, "sleeping": engine_is_sleeping(host=VLLM_VISION_HOST, timeout=1.5)}
+
 @app.route("/gpu/monitor", methods=["GET"])
 @swag_from(GPU_MONITOR_SWAGGER_DOC)
 def gpu_monitor_view():
@@ -1436,7 +1506,8 @@ def gpu_monitor_view():
     Read-only and cheap: the Monitor screen polls it while it is open, which is
     why it is a passive GET (it must not keep the engine awake).
     """
-    return jsonify(gpu_snapshot(float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))))
+    return jsonify(gpu_snapshot(float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.80")),
+        engine_reader=_engine_state))
 
 @app.route("/vision-backend", methods=["GET"])
 @swag_from(GET_VISION_BACKEND_SWAGGER_DOC)

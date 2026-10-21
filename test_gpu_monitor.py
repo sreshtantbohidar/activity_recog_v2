@@ -98,10 +98,10 @@ class EngineLookupTests(unittest.TestCase):
 class EvaluationTests(unittest.TestCase):
     total = 16376
 
-    def evaluate(self, used_mib, processes):
+    def evaluate(self, used_mib, processes, engine=None):
         return monitor.evaluate({"name": "NVIDIA RTX A4000", "total_mib": self.total,
                                  "used_mib": used_mib, "free_mib": self.total - used_mib},
-                                processes, 0.92)
+                                processes, 0.92, engine)
 
     def test_ours_alone_leaves_room_to_restart(self):
         """The normal serving state: the engine holds the card, nothing else does."""
@@ -147,6 +147,34 @@ class EvaluationTests(unittest.TestCase):
                                       {"pid": 2, "name": "other", "used_mib": 13000, "app": False}])
         self.assertFalse(tight["audio_ok"])
 
+    def test_a_serving_engine_is_not_reported_as_an_outage(self):
+        """The card can be too full to restart while the service serves perfectly."""
+        verdict = self.evaluate(12864, [{"pid": 1, "name": "VLLM::EngineCore", "used_mib": 10094, "app": True},
+                                        {"pid": 2, "name": "python3", "used_mib": 2770, "app": False}],
+                                engine={"reachable": True, "sleeping": False})
+        self.assertEqual(verdict["status"], monitor.OK)
+        self.assertTrue(verdict["ok"])
+        self.assertTrue(verdict["engine_running"])
+        self.assertFalse(verdict["restart_ok"])
+        self.assertIn("engine is running", verdict["detail"].lower())
+        self.assertNotIn("not enough vram", verdict["detail"].lower())
+
+    def test_a_parked_engine_that_cannot_wake_is_critical(self):
+        """Parked weights come back on the next request, so the budget is live again."""
+        verdict = self.evaluate(3605, [{"pid": 2, "name": "python3", "used_mib": 2770, "app": False},
+                                        {"pid": 3, "name": "vllm serve", "used_mib": 630, "app": True}],
+                                engine={"reachable": True, "sleeping": True})
+        self.assertEqual(verdict["status"], monitor.CRITICAL)
+        self.assertFalse(verdict["restart_ok"])
+        self.assertIn("wake the parked engine", verdict["detail"])
+
+    def test_an_unreachable_engine_keeps_the_plain_budget_verdict(self):
+        verdict = self.evaluate(3605, [{"pid": 2, "name": "python3", "used_mib": 2770, "app": False}],
+                                engine={"reachable": False, "sleeping": None})
+        self.assertEqual(verdict["status"], monitor.CRITICAL)
+        self.assertFalse(verdict["engine_reachable"])
+        self.assertIn("not enough vram", verdict["detail"].lower())
+
 
 class SnapshotTests(unittest.TestCase):
     def snapshot(self, **kwargs):
@@ -185,6 +213,18 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(frame["processes"], [])
         self.assertEqual(frame["resource"]["status"], monitor.WARNING)
         self.assertIsNone(frame["resource"]["required_mib"])
+
+    def test_snapshot_carries_the_engine_state_it_was_given(self):
+        frame = self.snapshot(engine_reader=lambda: {"reachable": True, "sleeping": False})
+        self.assertEqual(frame["resource"]["status"], monitor.OK)
+        self.assertTrue(frame["resource"]["engine_running"])
+
+    def test_a_failing_engine_probe_does_not_break_the_frame(self):
+        def boom():
+            raise RuntimeError("engine probe exploded")
+        frame = self.snapshot(engine_reader=boom)
+        self.assertTrue(frame["available"])
+        self.assertIsNone(frame["resource"]["engine_running"])
 
 
 if __name__ == "__main__":
