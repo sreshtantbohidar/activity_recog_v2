@@ -1,0 +1,65 @@
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1 \
+    HF_HOME=/app/hf_cache \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    YOLO_CONFIG_DIR=/tmp/ultralytics \
+    TRITON_CACHE_DIR=/tmp/triton \
+    HOME=/home/app \
+    USER=app
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl ffmpeg fonts-dejavu-core gcc g++ libgl1 libglib2.0-0 libgomp1 libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip==24.3.1 \
+    && python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.8.0 torchvision==0.23.0 \
+    && python -m pip install -r /app/requirements.txt \
+    && python -m pip install "vllm==0.11.0" "transformers>=4.57,<5" \
+        "paramiko>=3.4,<5" "faster-whisper>=1.0,<2"
+
+# The Ubuntu build context contains ordinary, fully materialized model folders.
+# Copy the context once: copying the model folders separately and then copying
+# the whole tree would add the same 22 GB to two different image layers.
+COPY . /app
+
+ENV VLLM_MODEL_ID=/app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit \
+    VLLM_VISION_MODEL=/app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit \
+    QWEN_AUDIO_MODEL_ID=/app/hf_models/Qwen2.5-Omni-3B \
+    WHISPER_MODEL_ID=/app/whisper_models/faster-whisper-large-v3 \
+    WHISPER_DOWNLOAD_ROOT=/app/whisper_models \
+    OBJECT_MODEL_PATH=/app/object_detect_model_256_class.pt
+
+RUN test -s /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit/config.json \
+    && test -s /app/hf_models/Qwen2.5-Omni-3B/config.json \
+    && test -s /app/whisper_models/faster-whisper-large-v3/model.bin \
+    && test -s /app/object_detect_model_256_class.pt \
+    && test -s /app/app.py \
+    && test -s /app/entrypoint.sh \
+    && mkdir -p /app/logs /app/tmp /app/reports /app/config /app/segments \
+        /app/secrets /app/data /app/hf_cache /home/app /tmp/triton /tmp/ultralytics \
+    && ln -sf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+        /tmp/ultralytics/Arial.Unicode.ttf \
+    && chown -R 65532:65532 /app/logs /app/tmp /app/reports /app/config \
+        /app/segments /app/secrets /app/data /app/hf_cache /home/app /tmp/triton /tmp/ultralytics \
+    && sed -i 's/\r$//' /app/entrypoint.sh /app/deploy/*.sh \
+    && chmod +x /app/entrypoint.sh \
+    && echo "app:x:65532:65532:Activity Service:/home/app:/bin/false" >> /etc/passwd \
+    && echo "app:x:65532:" >> /etc/group
+
+USER 65532:65532
+EXPOSE 5009
+HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:5009/health || exit 1
+ENTRYPOINT ["/app/entrypoint.sh"]
+

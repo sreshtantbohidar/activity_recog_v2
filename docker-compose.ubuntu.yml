@@ -1,0 +1,26 @@
+# Ubuntu/Linux override. It removes the Windows paths and the Hugging Face named
+# volume from the base file. That volume must not be mounted on an offline image:
+# an empty volume hides the model files baked into the image.
+services:
+  activity-recognition:
+    image: activity-recognition:2.0.0
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      VLLM_MODEL_ID: /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit
+      VLLM_VISION_MODEL: /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit
+      QWEN_AUDIO_MODEL_ID: /app/hf_models/Qwen2.5-Omni-3B
+      WHISPER_MODEL_ID: /app/whisper_models/faster-whisper-large-v3
+      WHISPER_DOWNLOAD_ROOT: /app/whisper_models
+      OBJECT_MODEL_PATH: /app/object_detect_model_256_class.pt
+      REPORTS_HOST_PATH: /app/reports
+    volumes: !override
+      - ./reports:/app/reports
+      - ./config:/app/config
+      - activity-data:/app/data
+      - ${TEST_VIDEOS_DIR:-./testvideos}:/testvideos:ro
+      - ./secrets:/app/secrets:ro

@@ -1,0 +1,148 @@
+services:
+  # One container, one GPU: the vLLM engine (Qwen3-VL-8B int4 AWQ) is started by
+  # the entrypoint inside this service, and the API runs the audio model stage
+  # while the engine sleeps. There is no second model server and no fallback.
+  activity-recognition:
+    build:
+      context: .
+      args:
+        PRELOAD_MODELS: ${PRELOAD_MODELS:-0}
+    image: activity-recognition:2.0.0
+    ports:
+      - "${ACTIVITY_PORT:-5009}:5009"
+    environment:
+      ACTIVITY_VISION_BACKEND: vllm
+      VLLM_VISION_HOST: http://127.0.0.1:8001
+      VLLM_MODEL_ID: ${VLLM_MODEL_ID:-cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit}
+      VLLM_VISION_MODEL: ${VLLM_VISION_MODEL:-cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit}
+      QWEN_AUDIO_MODEL_ID: ${QWEN_AUDIO_MODEL_ID:-Qwen/Qwen2.5-Omni-3B}
+      QWEN_AUDIO_LOAD_IN_4BIT: ${QWEN_AUDIO_LOAD_IN_4BIT:-0}
+      REQUIRE_CUDA: "1"
+      # GPU selection is portable: all host GPUs are attached (see the
+      # reservation below) and CUDA_VISIBLE_DEVICES picks the one to use. On a
+      # single-GPU host that is simply index 0; on the Windows dev box the 24 GB
+      # card is PCI index 1 (its 4 GB Quadro K2200 cannot run these models).
+      # NOTE: do not use Docker's `--gpus device=N` / device_ids here; on this
+      # Docker Desktop host its ordinal does not match the CUDA ordinal and it
+      # resolves to the Quadro. Selection is done through CUDA_VISIBLE_DEVICES.
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: "${GPU_DEVICE_INDEX:-0}"
+      # Engine dtype override (auto keeps the image portable across GPU
+      # generations: Ampere+ uses bfloat16, older cards fall back to float16).
+      VLLM_DTYPE: "${VLLM_DTYPE:-auto}"
+      # The engine may take most of the card: it is put to sleep (weights
+      # offloaded to CPU, KV cache released) before the audio model runs, so
+      # vision and audio never need to be resident at the same time. The 4-bit
+      # weights are ~7.5 GB and the vision encoder cache needs headroom, so a
+      # small budget such as 0.45 leaves no room for the KV cache.
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.80}
+      VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
+      VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS:-1}
+      VLLM_MM_MAX_PIXELS: ${VLLM_MM_MAX_PIXELS:-200704}
+      VLLM_MM_NFRAMES: ${VLLM_MM_NFRAMES:-8}
+      # Seconds without an API request before the engine is parked and its VRAM
+      # released for other containers (0 disables idling).
+      VLLM_IDLE_SLEEP_SECONDS: ${VLLM_IDLE_SLEEP_SECONDS:-60}
+      # Parking only returns what vLLM tracks (weights and KV cache). An engine
+      # that has served for hours keeps several GB more that /sleep cannot
+      # release: 5.7 GB measured against 0.66 GB for a freshly started engine,
+      # which grows with use until it fills the utilisation budget. After this
+      # many idle seconds, an engine still holding more than
+      # VLLM_RECYCLE_VRAM_MIB is therefore restarted by the entrypoint's
+      # supervised start (the replacement parks to its fresh footprint). 0
+      # disables recycling. A request arriving during the restart waits for it.
+      VLLM_RECYCLE_AFTER_IDLE_SECONDS: ${VLLM_RECYCLE_AFTER_IDLE_SECONDS:-300}
+      VLLM_RECYCLE_VRAM_MIB: ${VLLM_RECYCLE_VRAM_MIB:-1536}
+      # How long a request waits for the engine to answer, e.g. while the
+      # supervised restart of an idle recycle is still loading it.
+      VLLM_ENGINE_READY_TIMEOUT_SECONDS: ${VLLM_ENGINE_READY_TIMEOUT_SECONDS:-180}
+      MAX_CRUCIAL_FRAMES: ${MAX_CRUCIAL_FRAMES:-6}
+      CRUCIAL_FRAME_SCORE_THRESHOLD: ${CRUCIAL_FRAME_SCORE_THRESHOLD:-0.08}
+      CRUCIAL_FRAME_MIN_GAP_SECONDS: ${CRUCIAL_FRAME_MIN_GAP_SECONDS:-0.75}
+      # /detect-objects-video: every frame is annotated, but only this many
+      # sampled frames and detections are returned so the queued response stays
+      # small. Clips are retained under REPORTS_DIR/object-videos; the newest
+      # OBJECT_VIDEO_RETENTION are kept and older downloads return 404.
+      OBJECT_VIDEO_SAMPLE_INTERVAL_SECONDS: ${OBJECT_VIDEO_SAMPLE_INTERVAL_SECONDS:-1}
+      OBJECT_VIDEO_MAX_SAMPLED_FRAMES: ${OBJECT_VIDEO_MAX_SAMPLED_FRAMES:-30}
+      OBJECT_VIDEO_MAX_DETECTIONS: ${OBJECT_VIDEO_MAX_DETECTIONS:-300}
+      OBJECT_VIDEO_MAX_TRACKS: ${OBJECT_VIDEO_MAX_TRACKS:-500}
+      OBJECT_VIDEO_RETENTION: ${OBJECT_VIDEO_RETENTION:-25}
+      # Re-encode the annotated clip as H.264 so the dashboard can play it
+      # inline; the mp4v original is kept when ffmpeg fails.
+      OBJECT_VIDEO_TRANSCODE: ${OBJECT_VIDEO_TRANSCODE:-1}
+      REPORTS_DIR: /app/reports
+      REPORTS_HOST_PATH: ${REPORTS_HOST_PATH:-/home/demo/projects/activity_recog_v2/reports}
+      RUNTIME_CONFIG_PATH: /app/config/runtime.json
+      # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
+      # On this WSL2 + Blackwell host it makes every CUDA allocation fail with
+      # "RuntimeError: CUDA driver error: unknown error", so the vLLM engine
+      # cannot start. It was harmless on the older manual container because the
+      # variable was simply never set there.
+      HF_HUB_OFFLINE: "0"
+      MAX_VIDEO_FRAMES: ${MAX_VIDEO_FRAMES:-24}
+      FRAME_INTERVAL_SECONDS: ${FRAME_INTERVAL_SECONDS:-2}
+      ENABLE_AUDIO_ANALYSIS: ${ENABLE_AUDIO_ANALYSIS:-0}
+      # Speech transcription backend: dedicated ASR (faster-whisper large-v3,
+      # best accuracy + timestamps) with the audio-model speech pass as fallback.
+      TRANSCRIPTION_BACKEND: ${TRANSCRIPTION_BACKEND:-whisper}
+      WHISPER_MODEL_ID: ${WHISPER_MODEL_ID:-large-v3}
+      WHISPER_DOWNLOAD_ROOT: /opt/whisper
+      # Internal request queue. The heavy endpoints enqueue their work and answer
+      # 202 with a job id; one worker thread runs them in arrival order so two
+      # requests cannot contend for the single GPU. History (status, response,
+      # timings) lives in SQLite on the activity-data volume.
+      JOB_DB_PATH: ${JOB_DB_PATH:-/app/data/jobs.sqlite3}
+      JOB_FILES_DIR: ${JOB_FILES_DIR:-/app/data/uploads}
+      JOB_HISTORY_LIMIT: ${JOB_HISTORY_LIMIT:-200}
+      JOB_MAX_PENDING: ${JOB_MAX_PENDING:-32}
+      JOB_RESPONSE_MAX_CHARS: ${JOB_RESPONSE_MAX_CHARS:-262144}
+      # Uploads retained so a job can be reloaded: the newest N, and never more
+      # than this many bytes in total. Released when the row goes.
+      JOB_REPLAY_RETENTION: ${JOB_REPLAY_RETENTION:-10}
+      JOB_REPLAY_MAX_BYTES: ${JOB_REPLAY_MAX_BYTES:-1073741824}
+      DB_NAME: ${DB_NAME:-isquare}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-5432}
+      # SFTP delivery for the DB-driven /detect-objects mode: annotated artefacts
+      # are published to the shared file server and their URL is recorded in
+      # media_analysis.output_file_path. Left empty the mode returns 502.
+      SFTP_HOST: ${SFTP_HOST:-}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USER: ${SFTP_USER:-}
+      SFTP_PRIVATE_KEY_PATH: ${SFTP_PRIVATE_KEY_PATH:-/app/secrets/id_ed25519}
+      SFTP_REMOTE_DIR: ${SFTP_REMOTE_DIR:-}
+      OUTPUT_PUBLIC_BASE: ${OUTPUT_PUBLIC_BASE:-}
+      OUTPUT_PUBLIC_PATH: ${OUTPUT_PUBLIC_PATH:-/media_analytics/output}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "2gb"
+    volumes:
+      - huggingface-cache:/models/huggingface
+      - ./reports:/app/reports
+      - ./config:/app/config
+      # Queue history and staged uploads. A named volume (rather than a bind
+      # mount) so the container uid 65532 keeps write access on every host.
+      - activity-data:/app/data
+      # Read-only mount of the sample clips used for end-to-end activity tests.
+      # Kept out of the image so testers can point it at any folder.
+      - ${TEST_VIDEOS_DIR:-C:/Users/Hp/projects/activity_videos_for_testing}:/testvideos:ro
+      # Private key for SFTP delivery, kept out of the image (see .dockerignore).
+      - ./secrets:/app/secrets:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # Attach every host GPU; the single-GPU pinning happens in
+            # CUDA_VISIBLE_DEVICES above. `count: 1` would hand the container
+            # whichever card Docker enumerates first (the Quadro here).
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    stop_grace_period: 60s
+volumes:
+  huggingface-cache:
+  activity-data:
