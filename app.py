@@ -1580,10 +1580,12 @@ def _absolute_base_url(base_url=None):
     """Base URL for links inside a queued response.
 
     The queue worker runs outside a request context, so the submitter's origin is
-    captured in the route and passed in. PUBLIC_BASE_URL overrides it for a
-    deployment behind a proxy and for replayed jobs, which have no request.
+    captured in the route and passed in. PUBLIC_BASE_URL takes precedence: set it
+    when clients reach the service through a proxy or a name the request does not
+    carry, and for replayed jobs (which have no request). Otherwise the origin the
+    client used to submit the job is returned.
     """
-    configured = (base_url or os.getenv("PUBLIC_BASE_URL", "")).strip()
+    configured = os.getenv("PUBLIC_BASE_URL", "").strip() or (base_url or "").strip()
     return configured.rstrip("/")
 
 def _queued_video_object_detection(path, name, base_url=None):
