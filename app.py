@@ -363,6 +363,11 @@ class ObjectDetector:
         result["annotated_video_path"] = str(artifact)
         result["annotated_video_url"] = f"/object-videos/{artifact.name}"
         result["annotated_video_codec"] = codec
+        result["annotated_video_filename"] = artifact.name
+        try:
+            result["annotated_video_size_bytes"] = artifact.stat().st_size
+        except OSError:
+            result["annotated_video_size_bytes"] = None
         return result
 
     def track_frames(self, paths, timestamps):
@@ -1571,11 +1576,32 @@ def _queued_object_detection(path, name):
     report_progress(90, "encoding annotation")
     return jsonify({"filename":name,"object_detection":result})
 
-def _queued_video_object_detection(path, name):
-    """Queued body for /detect-objects-video; the queue owns the upload."""
+def _absolute_base_url(base_url=None):
+    """Base URL for links inside a queued response.
+
+    The queue worker runs outside a request context, so the submitter's origin is
+    captured in the route and passed in. PUBLIC_BASE_URL overrides it for a
+    deployment behind a proxy and for replayed jobs, which have no request.
+    """
+    configured = (base_url or os.getenv("PUBLIC_BASE_URL", "")).strip()
+    return configured.rstrip("/")
+
+def _queued_video_object_detection(path, name, base_url=None):
+    """Queued body for /detect-objects-video; the queue owns the upload.
+
+    The response carries the annotated clip three ways: the container path
+    (``annotated_video_path``), a host-relative URL for the dashboard
+    (``annotated_video_url``), and an absolute HTTP URL that fetches the file as
+    an attachment (``annotated_video_download_url``). Clients that do not know
+    the service origin use the last one.
+    """
     report_progress(10, "opening video")
     result = detector.detect_video(path)
     report_progress(95, "finalising detections")
+    relative = result.get("annotated_video_url")
+    if relative:
+        result["annotated_video_download_url"] = \
+            f"{_absolute_base_url(base_url)}{relative}?download=1"
     return jsonify({"filename":name,"media_type":"video","object_detection":result})
 
 # How a replay rebuilds a request from a retained upload, per endpoint.
@@ -1851,15 +1877,22 @@ def detect_objects_video_api():
     on the single queue worker.
     """
     path, name = _stage_video_upload()
+    base_url = request.host_url
     return _enqueue("/detect-objects-video",
-        lambda: _queued_video_object_detection(path, name),
+        lambda: _queued_video_object_detection(path, name, base_url),
         filename=name, media_type="video", input_path=path)
 
 @app.route("/object-videos/<path:filename>", methods=["GET"])
 @swag_from(DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC)
 def download_object_video(filename):
-    """Serve an annotated clip written by /detect-objects-video."""
-    return send_from_directory(str(object_video_dir()), filename, as_attachment=False)
+    """Serve an annotated clip written by /detect-objects-video.
+
+    ``?download=1`` sends it as an attachment, which is what the absolute
+    ``annotated_video_download_url`` in the job response uses. Without the flag
+    the clip is served inline so the dashboard can play it.
+    """
+    return send_from_directory(str(object_video_dir()), filename,
+        as_attachment=request.args.get("download") == "1")
 
 @app.errorhandler(UploadTooLargeError)
 @app.errorhandler(VideoTooLongError)

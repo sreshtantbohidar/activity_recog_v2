@@ -130,7 +130,9 @@ DETECT_OBJECTS_VIDEO_SWAGGER_DOC = {
     "description": ("Runs the dedicated YOLO model over every frame with persistent tracking. "
                     "Detections returned in the job response are sampled and bounded so a long clip "
                     "cannot inflate the queue history; every frame is still annotated in the clip "
-                    "served by annotated_video_url."),
+                    "served by annotated_video_url. The job response also carries "
+                    "annotated_video_path (container path) and annotated_video_download_url, "
+                    "an absolute HTTP URL that downloads the clip as an attachment."),
     "consumes": ["multipart/form-data"],
     "parameters": [{"name": "file", "in": "formData", "type": "file", "required": True,
                     "description": "Video to detect objects in (maximum 5 minutes)"}],
@@ -141,7 +143,9 @@ DETECT_OBJECTS_VIDEO_SWAGGER_DOC = {
 }
 DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC = {
     "tags": ["Object Detection"], "summary": "Download an annotated video-detection clip",
-    "parameters": [{"name":"filename","in":"path","required":True,"type":"string"}],
+    "parameters": [{"name":"filename","in":"path","required":True,"type":"string"},
+                   {"name":"download","in":"query","required":False,"type":"string","enum":["1"],
+                    "description":"Send the clip as an attachment instead of inline"}],
     "produces": ["video/mp4"],
     "responses": {"200":{"description":"Annotated video clip"},
                   "404":{"description":"Clip not found or aged out of retention","schema":ERROR}},
