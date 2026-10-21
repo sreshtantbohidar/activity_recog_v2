@@ -140,6 +140,7 @@ Runtime analysis settings are edited from the dashboard (`/config`) and stored i
 | `MAX_UPLOAD_BYTES` | `209715200` | Upload size limit |
 | `MAX_VIDEO_DURATION_SECONDS` | `300` | Rejection threshold for long video |
 | `VLLM_IDLE_SLEEP_SECONDS` | `60` | Idle time before the GPU is released |
+| `ENGINE_STARTUP_GRACE_SECONDS` | `360` | How long the API waits for the engine at startup (`0` = serve immediately) |
 | `MEDIA_TLS_VERIFY` | `0` | Verify TLS for remote media fetches |
 | `LOG_LEVEL` | `INFO` | Log verbosity |
 

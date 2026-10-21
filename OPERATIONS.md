@@ -36,7 +36,21 @@ The next request wakes the engine and reloads the audio model transparently.
 in-flight requests are never interrupted. Set `VLLM_IDLE_SLEEP_SECONDS=0` to
 disable idling and keep both models permanently resident.
 
-GPU inference is required. The API returns unavailable/backend errors when CUDA is not exposed to the container; it never silently performs model inference on CPU. Media decoding, preprocessing, HTTP handling and transfers into VRAM still require bounded CPU and system RAM.
+## Starting the API before the engine
+
+The entrypoint waits up to `ENGINE_STARTUP_GRACE_SECONDS` (default 360) for the
+engine, then starts Gunicorn anyway. Set it to `0` to start the API at once.
+
+The YOLO endpoints — `/detect-objects`, `/detect-objects-video` and the
+annotated-clip downloads, plus the queue and dashboard they run through — never
+touch the engine, so they keep working while it is loading or while its VRAM gate
+is waiting for another container to release the card. The vision endpoints
+(`/analyze-image`, `/analyze-video`, `/analyze-video-detailed`) answer `502`
+until the supervised engine is up, and `/health` plus the Monitor screen say so.
+
+## GPU inference is required
+
+The API returns unavailable/backend errors when CUDA is not exposed to the container; it never silently performs model inference on CPU. Media decoding, preprocessing, HTTP handling and transfers into VRAM still require bounded CPU and system RAM.
 
 ## Request queue
 

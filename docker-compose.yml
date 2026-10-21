@@ -56,6 +56,12 @@ services:
       # How long a request waits for the engine to answer, e.g. while the
       # supervised restart of an idle recycle is still loading it.
       VLLM_ENGINE_READY_TIMEOUT_SECONDS: ${VLLM_ENGINE_READY_TIMEOUT_SECONDS:-180}
+      # Seconds the entrypoint waits for the engine before starting the API.
+      # The YOLO endpoints (object/video object detection, queue, dashboard)
+      # never use the engine, so 0 starts the API immediately and lets the
+      # supervised engine join whenever the VRAM gate opens; analysis
+      # endpoints answer 502 until then and /health reports the engine.
+      ENGINE_STARTUP_GRACE_SECONDS: ${ENGINE_STARTUP_GRACE_SECONDS:-360}
       MAX_CRUCIAL_FRAMES: ${MAX_CRUCIAL_FRAMES:-6}
       CRUCIAL_FRAME_SCORE_THRESHOLD: ${CRUCIAL_FRAME_SCORE_THRESHOLD:-0.08}
       CRUCIAL_FRAME_MIN_GAP_SECONDS: ${CRUCIAL_FRAME_MIN_GAP_SECONDS:-0.75}

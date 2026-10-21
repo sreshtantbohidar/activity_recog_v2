@@ -79,19 +79,33 @@ supervise() {
 supervise &
 SUPERVISOR_PID=$!
 
-echo "[entrypoint] waiting for the vLLM engine on ${HOST}:${PORT} ..."
-ATTEMPTS=0
-until curl -fsS "http://${HOST}:${PORT}/health" >/dev/null 2>&1; do
-  ATTEMPTS=$((ATTEMPTS + 1))
-  # Do not block startup forever: after ~6 minutes start the API anyway so
-  # /health can report the engine as unreachable while it keeps retrying.
-  if [ "$ATTEMPTS" -ge 90 ]; then
-    echo "[entrypoint] engine still not ready; starting Gunicorn anyway" >&2
-    break
-  fi
-  sleep 4
-done
-echo "[entrypoint] vLLM engine ready; starting Gunicorn"
+# How long the API waits for the engine before serving without it. The YOLO
+# endpoints (object detection, video object detection, the queue and the
+# dashboard) never touch the engine, so holding them hostage to a model load,
+# or to a VRAM gate that is waiting for another container to release the card,
+# costs functionality for nothing. 0 starts Gunicorn at once; the supervised
+# engine still joins whenever the gate opens, and the analysis endpoints answer
+# 502 until it does (/health reports it).
+GRACE="${ENGINE_STARTUP_GRACE_SECONDS:-360}"
+case "$GRACE" in
+  ''|*[!0-9]*) GRACE=360 ;;
+esac
+if [ "$GRACE" -gt 0 ]; then
+  echo "[entrypoint] waiting up to ${GRACE}s for the vLLM engine on ${HOST}:${PORT} ..."
+  ATTEMPTS=0
+  MAX_ATTEMPTS=$((GRACE / 4 + 1))
+  until curl -fsS "http://${HOST}:${PORT}/health" >/dev/null 2>&1; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+      echo "[entrypoint] engine still not ready after ${GRACE}s; starting the API anyway" >&2
+      break
+    fi
+    sleep 4
+  done
+else
+  echo "[entrypoint] not waiting for the vLLM engine (ENGINE_STARTUP_GRACE_SECONDS=0)" >&2
+fi
+echo "[entrypoint] starting Gunicorn"
 
 exec gunicorn --bind 0.0.0.0:5009 --worker-class gthread --workers 1 --threads 4 \
   --timeout 600 --graceful-timeout 30 --access-logfile - --error-logfile - app:app
