@@ -1,0 +1,469 @@
+================================================================================
+VIDEO OBJECT DETECTION -- MODE B (UPLOAD + SAVE TO POSTGRESQL)
+Integration guide for developers / AI agents
+Service: activity-recognition 2.0.0 (container actvity_recog_v2-activity-recognition-1)
+Verified: 2026-10-23 against http://192.168.1.125:5009 and PostgreSQL "isquare"
+================================================================================
+
+1. SCOPE
+--------------------------------------------------------------------------------
+Mode B is the multipart upload form of POST /detect-objects-video:
+
+    file = the video to analyse        (required)
+    id   = public.media_analysis.id    (optional, but required to save)
+
+When "id" is present the finished detection is written back to that row:
+analysis_summary (JSONB), output_file_path, status = 1.
+
+Without "id" the detection still runs and returns its result, but PostgreSQL is
+NOT touched. That is by design: an upload has no row of its own, so the caller
+must name the row.
+
+Mode A (JSON body {"id": n}, service downloads the clip from the row) accepts a
+different input but saves the same full detection result. See section 12.
+
+This service has NO authentication. Expose it only on a trusted network or put
+a gateway in front of it.
+
+Base URL used below: http://192.168.1.125:5009
+(container publishes 0.0.0.0:5009; replace the host with the one you can reach)
+
+
+2. QUICK FLOW (TL;DR)
+--------------------------------------------------------------------------------
+    1. The product creates/owns a row in public.media_analysis, status = 0.
+    2. POST multipart file + id  -> 202 + job_id
+    3. GET /queue/<job_id> every 2-5 s until completed / failed / cancelled
+    4. Read "response": id, status=1, output_file_path, object_detection
+    5. Read the row (or the response) for analysis_summary, and download the
+       annotated clip from annotated_video_download_url.
+
+All heavy work is queued. The POST never blocks for inference.
+
+One successful POST is enough to persist the result: the queue worker writes the
+row when the job completes, whether or not the caller polls. Polling
+GET /queue/<job_id> (or media_analysis.status) only tells the caller when that
+write has happened; it does not perform or trigger the write.
+
+
+3. PREREQUISITES
+--------------------------------------------------------------------------------
+3.1 Database row
+    The service never INSERTs. The row must already exist when the job runs.
+    Relevant columns:
+
+        id                integer, PK              target of the update
+        media_type        varchar(50)              read to choose the SFTP
+                                                    sub-folder, e.g. "video"
+        status            integer NOT NULL         set to 1 on success
+        analysis_summary  jsonb                    overwritten with the result
+        output_file_path  varchar(1024)            annotated clip URL
+        file_path         jsonb                    NOT used by Mode B (Mode A)
+        user_id_id, fn, fp, tn, tp, created_at     NOT NULL; set by the product
+
+3.2 Service configuration (already set on this deployment)
+    DB    : DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD
+            (config/runtime.json overrides container env at startup)
+    SFTP  : SFTP_HOST / SFTP_PORT / SFTP_USER / key at SFTP_PRIVATE_KEY_PATH
+            Needed for output_file_path. Without it the summary is still saved,
+            but no URL is written (see 7.3).
+    Output: OUTPUT_PUBLIC_BASE + OUTPUT_PUBLIC_PATH build the public URL, e.g.
+            https://192.168.1.125:9000/media_analytics/output
+    PUBLIC_BASE_URL: if set, it is used for the absolute download URL in the
+            response; if empty, the origin the client POSTed to is used.
+
+3.3 Limits (current values)
+    Max upload size       200 MB           (MAX_UPLOAD_BYTES)
+    Max video duration    300 s            (MAX_VIDEO_DURATION_SECONDS)
+    Accepted extensions   mp4, avi, mov, mkv, webm
+    Supported codecs      h264, hevc
+    Other codecs          vp8, vp9, av1 -> transcoded to H.264/MP4 first
+    Clip retention        newest 25 clips (OBJECT_VIDEO_RETENTION)
+    Queue                 single worker, backlog 32; full -> HTTP 503
+
+
+4. STEP 1 -- CREATE THE ROW (done by the calling product)
+--------------------------------------------------------------------------------
+Minimum example for a test (adjust user_id_id to a real auth_user.id):
+
+    INSERT INTO public.media_analysis
+        (title, category, file_name, media_type, status,
+         user_id_id, fn, fp, tn, tp, created_at)
+    VALUES
+        ('inspection clip', 'object recognition', 'clip.mp4', 'video', 0,
+         110, 0, 0, 0, 0, now())
+    RETURNING id;
+
+Keep that id -- it is the "id" form field. status must be 0 (or any value) and
+will become 1 when the detection is saved.
+
+
+5. STEP 2 -- SUBMIT THE UPLOAD
+--------------------------------------------------------------------------------
+5.1 curl
+
+    curl -X POST http://192.168.1.125:5009/detect-objects-video \
+         -F "file=@/path/clip.mp4" \
+         -F "id=618"
+
+    Do NOT set Content-Type manually: the multipart boundary must be generated
+    by the client. Do NOT send a JSON body together with a file.
+
+5.2 Python (requests)
+
+    import time, requests
+
+    API = "http://192.168.1.125:5009"
+
+    with open("clip.mp4", "rb") as fh:
+        r = requests.post(
+            f"{API}/detect-objects-video",
+            files={"file": ("clip.mp4", fh, "video/mp4")},
+            data={"id": "618"},
+            timeout=300,               # upload only; work is queued
+        )
+    r.raise_for_status()               # 202 expected
+    job_id = r.json()["job_id"]
+
+5.3 Success response: HTTP 202
+
+    {
+      "job_id": "ad93b0c4ccc04e24ba5a9fb9f9af796a",
+      "seq": 315,
+      "endpoint": "/detect-objects-video",
+      "status": "queued",
+      "queue_position": 1,
+      "progress": 0,
+      "status_url": "/queue/ad93b0c4ccc04e24ba5a9fb9f9af796a",
+      "media_type": "video",
+      "filename": "clip.mp4",
+      "replayable": true,
+      "cancellable": true
+    }
+
+    The Location header also points at status_url. Nothing has been inferred yet.
+
+5.4 Immediate errors (returned on the POST, no job is created)
+
+    400  missing/empty "file"
+    400  unsupported extension
+    400  "id" is not an integer
+    400  unreadable/corrupt video (duration probe fails)
+    413  upload larger than 200 MB
+    413  video longer than 300 s
+    503  queue backlog full (response also contains "queue")
+
+    A successful POST does not prove the row exists -- that is checked on the
+    worker (see 7.3).
+
+
+6. STEP 3 -- POLL THE JOB
+--------------------------------------------------------------------------------
+6.1 Request
+
+    GET http://192.168.1.125:5009/queue/<job_id>
+
+    A single-job GET always includes the full stored "response"; no query
+    parameter is needed. Poll every 2-5 s.
+
+6.2 Status values
+
+    queued      waiting for the single worker
+    running     inference in progress (progress + progress_detail)
+    completed   finished; response is available
+    failed      finished with error; see "error" and "http_status"
+    cancelled   stopped by POST /queue/<job_id>/cancel
+
+6.3 Progress detail strings you may see
+
+    "converting vp8 video" / "video prepared"     codec conversion
+    "annotating frame 125/240"                    per-frame YOLO + tracking
+    "encoding web-ready clip"                     H.264 transcode
+    "finalising detections"                       result assembly
+    "publishing artefact" (Mode A only)
+
+6.4 Completed job record (abridged)
+
+    {
+      "job_id": "ad93b0c4ccc04e24ba5a9fb9f9af796a",
+      "status": "completed",
+      "progress": 100,
+      "http_status": 200,
+      "error": null,
+      "duration_seconds": 12.4,
+      "response": { ...see section 7... }
+    }
+
+    On failure: "error" holds a message and "http_status" the code the worker
+    would have returned (400 bad media, 502 backend, 500 unexpected).
+
+6.5 Python polling loop
+
+    def wait_for(api, job_id, timeout=900, interval=3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = requests.get(f"{api}/queue/{job_id}", timeout=30).json()
+            if job["status"] in ("completed", "failed", "cancelled"):
+                return job
+            time.sleep(interval)
+        raise TimeoutError(f"job {job_id} still {job['status']}")
+
+
+7. STEP 4 -- WHAT IS SAVED TO POSTGRESQL
+--------------------------------------------------------------------------------
+7.1 Exactly one UPDATE is executed, after the annotated clip is published:
+
+    UPDATE public.media_analysis
+       SET analysis_summary  = %s,                        -- jsonb
+           output_file_path  = COALESCE(%s, output_file_path),
+           status            = 1
+     WHERE id = %s;
+
+    analysis_summary = the complete object_detection object (section 7.2)
+    output_file_path = the SFTP-published clip URL, only when the publish worked
+    status           = 1
+
+    COALESCE means a failed SFTP publish never blanks a working URL already in
+    the row. The update is committed once.
+
+7.2 analysis_summary contents (rich, Mode B)
+
+    "detections" is sampled (every OBJECT_VIDEO_SAMPLE_INTERVAL_SECONDS, 1 s by
+    default) and capped at 300 entries; "tracks" is capped at 500. Every frame
+    is still annotated regardless of those caps.
+
+    {
+      "fps": 30.0,
+      "duration_sec": 3.0,
+      "frames_analyzed": 90,
+      "frames_annotated": 90,
+      "frames_sampled": 3,
+      "sample_interval_sec": 1.0,
+      "detections": [
+        {"frame_index": 0, "timestamp_sec": 0.0, "objects": []},
+        {"frame_index": 30, "timestamp_sec": 1.0, "objects": []},
+        {"frame_index": 60, "timestamp_sec": 2.0, "objects": []}
+      ],
+      "detected_object_counts": {"WINGLOONG_1D": 1},
+      "max_concurrent_counts": {"WINGLOONG_1D": 1},
+      "tracks": [
+        {"track_id": 1, "class": "WINGLOONG_1D", "observations": 9,
+         "first_seen_sec": 1.2, "last_seen_sec": 1.47,
+         "max_confidence": 0.3671}
+      ],
+      "tracks_truncated": false,
+      "detections_truncated": false,
+      "annotated_video_path": "/app/reports/object-videos/detected_..._h264.mp4",
+      "annotated_video_url": "/object-videos/detected_..._h264.mp4",
+      "annotated_video_download_url":
+          "http://127.0.0.1:5009/object-videos/detected_..._h264.mp4?download=1",
+      "annotated_video_filename": "detected_..._h264.mp4",
+      "annotated_video_codec": "h264",
+      "annotated_video_size_bytes": 41818
+    }
+
+    Note: annotated_video_path is a path inside the container and is not usable
+    by other products. Use annotated_video_url / annotated_video_download_url,
+    or output_file_path.
+
+7.3 Save failures are warnings, not job failures
+
+    The detection result is returned and the job is "completed" even when the
+    save did not happen. Inspect "persistence_warning" in the response:
+
+    "media_analysis.id=N does not exist; result not saved"
+        -> wrong id, or the row was deleted before the worker ran. No UPDATE.
+
+    "annotated artefact not published: <reason>"
+        -> SFTP failed. analysis_summary and status=1 ARE still written;
+           output_file_path keeps its previous value.
+
+    "result not saved to PostgreSQL: <reason>"
+        -> DB error (auth, connectivity). Nothing was written.
+
+    Absence of persistence_warning means the row was updated successfully.
+
+7.4 HTTP response body on completion (Mode B with id)
+
+    {
+      "filename": "clip.mp4",
+      "media_type": "video",
+      "id": 618,
+      "status": 1,
+      "output_file_path":
+          "https://192.168.1.125:9000/media_analytics/output/video/detected_..._h264.mp4",
+      "object_detection": { ...same object stored in analysis_summary... }
+    }
+
+    If the publish failed, output_file_path is absent and persistence_warning is
+    present instead.
+
+
+8. STEP 5 -- GET THE ANNOTATED CLIP
+--------------------------------------------------------------------------------
+    Preferred: the absolute URL in the response
+
+        object_detection.annotated_video_download_url
+        (.../object-videos/<file>?download=1 -> attachment)
+
+    Or build it from the relative URL and your API base:
+
+        GET http://192.168.1.125:5009/object-videos/<filename>
+        GET http://192.168.1.125:5009/object-videos/<filename>?download=1
+
+    The same clip is published over SFTP and its public URL is stored in
+    media_analysis.output_file_path.
+
+    Only the newest 25 clips are kept. An older filename returns 404; the SFTP
+    copy and the analysis_summary in the row are unaffected.
+
+
+9. VERIFY THE SAVE YOURSELF
+--------------------------------------------------------------------------------
+    SELECT id, status, output_file_path,
+           analysis_summary->>'frames_annotated' AS frames_annotated,
+           analysis_summary->>'annotated_video_url' AS clip_url
+      FROM public.media_analysis
+     WHERE id = 618;
+
+    or the full JSON:
+
+    SELECT jsonb_pretty(analysis_summary)
+      FROM public.media_analysis
+     WHERE id = 618;
+
+    Expected after success: status = 1, analysis_summary not null,
+    output_file_path = published URL.
+
+
+10. ERROR HANDLING CHECKLIST FOR THE CALLING PRODUCT
+--------------------------------------------------------------------------------
+    [ ] Reject/repair non-integer id before POSTing (400 comes back otherwise).
+    [ ] Treat only 202 as "accepted"; show 400/413/503 messages to the user.
+    [ ] Poll with a timeout (>= 5 min; a 300 s clip can take minutes).
+    [ ] On status=failed, surface job["error"]; do not assume the row changed.
+    [ ] On status=completed, check response.persistence_warning.
+    [ ] Confirm media_analysis.status == 1 before declaring success downstream.
+    [ ] Do not retry automatically on 503; back off until the queue drains.
+    [ ] One job at a time is executed; many parallel jobs just queue up.
+
+    Idempotency: every POST creates a new job and a new annotated clip.
+    Re-running the same id overwrites analysis_summary/status and
+    output_file_path with the newest run. No de-duplication is performed.
+
+
+11. END-TO-END PYTHON EXAMPLE
+--------------------------------------------------------------------------------
+    import time, requests
+
+    API = "http://192.168.1.125:5009"
+
+    def detect_video_and_save(clip_path, record_id,
+                              timeout=900, interval=3):
+        with open(clip_path, "rb") as fh:
+            r = requests.post(
+                f"{API}/detect-objects-video",
+                files={"file": (clip_path, fh, "video/mp4")},
+                data={"id": str(record_id)},
+                timeout=300,
+            )
+        if r.status_code != 202:
+            raise RuntimeError(f"rejected: {r.status_code} {r.text}")
+        job_id = r.json()["job_id"]
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = requests.get(f"{API}/queue/{job_id}", timeout=30).json()
+            if job["status"] in ("completed", "failed", "cancelled"):
+                break
+            time.sleep(interval)
+        else:
+            raise TimeoutError(f"job {job_id} still running")
+
+        if job["status"] != "completed":
+            raise RuntimeError(f"{job['status']}: {job.get('error')}")
+
+        body = job["response"]
+        warning = body.get("persistence_warning")
+        if warning:
+            raise RuntimeError(f"detected but not saved: {warning}")
+
+        clip = body["object_detection"].get("annotated_video_download_url")
+        return body, clip
+
+
+12. DIFFERENCES FROM MODE A (FOR REFERENCE)
+--------------------------------------------------------------------------------
+    Mode A: POST JSON {"id": n}
+        - service reads media_analysis.file_path and downloads the video
+        - annotated clip is published to SFTP and also retained under
+          /app/reports/object-videos, so annotated_video_url stays downloadable
+        - analysis_summary is the full detection result (detections, tracks,
+          detected_object_counts, frames_analyzed, annotated_video_* ...)
+        - the POST returns 202 and "No record found" appears in the JOB
+          (http_status 404), not on the POST
+        - jobs can take minutes for long clips; row stays status=0 until done
+
+    Mode B (this document): POST multipart file + id
+        - caller uploads the bytes; file_path is not used
+        - rich analysis_summary + local clip + SFTP URL
+        - immediate 400/413 validation
+
+    Mode B without id: detection result only, NO database write.
+
+
+13. SOURCE OF TRUTH (MAINTAINERS)
+--------------------------------------------------------------------------------
+    app.py
+      detect_objects_video_api       route, mode dispatch, form id parsing
+      _form_record_id                empty -> None, non-integer -> 400
+      _stage_video_upload            extension + duration validation (sync)
+      _queued_video_object_detection worker body; persistence fields
+      _persistence_fields            {"id", "status"} + url / warning
+      ObjectDetector.detect_video    YOLO + ByteTrack, reports/object-videos
+      _write_annotated_artifact      Mode A / image artefacts; video -> detect_video
+      _transcode_for_web             mp4v -> H.264 MP4
+    detection_store.py
+      save_detection                 SELECT media_type, publish, UPDATE, commit
+      UPDATE_SQL                     analysis_summary / COALESCE / status
+    video_object_detection.py
+      annotate_with_detections       per-frame annotation + bounded evidence
+    sftp_upload.py
+      publish                        SFTP upload + public URL
+    Tests
+      test_detection_store.py        save contract, warning paths
+      test_video_object_detection.py tracking/annotation bounds
+
+    Live documentation
+      http://192.168.1.125:5009/docs/          Swagger UI
+      http://192.168.1.125:5009/apispec.json   OpenAPI 2.0
+      http://192.168.1.125:5009/health         service health
+      http://192.168.1.125:5009/health/components  DB, SFTP, GPU, engine
+
+
+14. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+    Row still status=0, no summary
+        -> job failed before the save. GET /queue/<job_id>, read "error".
+           Typical causes: no decodable frames, backend error, cancellation.
+
+    Response has no "id"/"status" keys
+        -> the "id" form field was missing or empty; nothing was saved.
+
+    persistence_warning "... does not exist"
+        -> the row was deleted or the id belongs to another database.
+
+    persistence_warning "not published"
+        -> SFTP unreachable or key rejected. Summary is saved; URL is not.
+
+    persistence_warning "result not saved to PostgreSQL"
+        -> DB auth/host problem. Check /health/components -> postgres.
+
+    /object-videos/<file> 404
+        -> clip aged out of the 25-clip retention.
+
+    WebM/VP8/VP9/AV1 upload fails with a codec conversion error
+        -> this was a bug fixed on 2026-10-23 (H.264 was being muxed into a
+           .webm container). If it reappears, the running image does not
+           contain the fix: convert to MP4 or redeploy the committed image.
+================================================================================

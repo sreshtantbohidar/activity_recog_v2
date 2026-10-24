@@ -2,7 +2,7 @@
 #
 # Produces, in <project>\deliverable\, everything the Ubuntu machine needs:
 #   activity-recognition-2.0.0-offline.tar   docker image, every model baked in
-#   activity-recognition-2.0.0-offline.tar.md5
+#   SHA256SUMS
 #   deploy\                                  deploy_ubuntu.sh + compose + env +
 #                                            verify script + runbook
 # Copy that folder to an external HDD; on the Ubuntu host run
@@ -20,34 +20,30 @@ $ErrorActionPreference = "Stop"
 docker info *> $null
 if ($LASTEXITCODE -ne 0) { throw "Docker is not running. Start Docker Desktop first." }
 
-# 1. Prefetch the checkpoints on the host (resumable; skips finished ones) ------
-#    The build then COPYs ./hf_models into the image without any network access,
-#    so a flaky HuggingFace connection can no longer stall a build.
-Write-Host "== Prefetching model checkpoints into .\hf_models ==" -ForegroundColor Cyan
-python deploy\prefetch_models.py
-if ($LASTEXITCODE -ne 0) { throw "Model prefetch incomplete - rerun this script to resume." }
-
-# 2. Build -----------------------------------------------------------------------
+# 1. Build -----------------------------------------------------------------------
 Write-Host "== Building activity-recognition:2.0.0 ==" -ForegroundColor Cyan
-docker compose build --build-arg PRELOAD_MODELS=1 2>&1 | Tee-Object -FilePath build_offline.log
+docker build -f Dockerfile.ubuntu -t activity-recognition:2.0.0 . 2>&1 | Tee-Object -FilePath build_offline.log
 if ($LASTEXITCODE -ne 0) { throw "Image build failed - see build_offline.log" }
 
 # 3. Verify the image is truly offline-capable (no GPU needed) -----------------
 Write-Host "== Verifying image contents (libraries + every checkpoint) ==" -ForegroundColor Cyan
-docker run --rm --entrypoint python activity-recognition:2.0.0 /app/deploy/verify_offline_image.py
+docker run --rm --network none --entrypoint python activity-recognition:2.0.0 /app/deploy/verify_ubuntu_image.py
 if ($LASTEXITCODE -ne 0) { throw "Offline verification FAILED - do not ship this image." }
 
 # 4. Export the deliverable folder for the external HDD --------------------------
 Write-Host "== Exporting deliverable ==" -ForegroundColor Cyan
+if (Test-Path deliverable) { Remove-Item -Recurse -Force deliverable }
 New-Item -ItemType Directory -Force -Path deliverable\deploy | Out-Null
 docker save -o deliverable\activity-recognition-2.0.0-offline.tar activity-recognition:2.0.0
 if ($LASTEXITCODE -ne 0) { throw "docker save failed." }
-# Windows-native checksum (md5sum is not always present):
-$hash = (Get-FileHash deliverable\activity-recognition-2.0.0-offline.tar -Algorithm MD5).Hash.ToLower()
-"  $hash  activity-recognition-2.0.0-offline.tar" |
-    Out-File -Encoding ascii deliverable\activity-recognition-2.0.0-offline.tar.md5
-Copy-Item deploy\deploy_ubuntu.sh, deploy\docker-compose.yml, deploy\docker-compose.ubuntu.yml, `
-    deploy\.env.ubuntu, deploy\entrypoint.sh, deploy\verify_offline_image.py, deploy\UBUNTU_DEPLOY.md `
+# Windows-native SHA-256 checksum.
+$hash = (Get-FileHash deliverable\activity-recognition-2.0.0-offline.tar -Algorithm SHA256).Hash.ToLower()
+"$hash  activity-recognition-2.0.0-offline.tar" |
+    Out-File -Encoding ascii deliverable\SHA256SUMS
+Copy-Item deploy\deploy_ubuntu.sh, deploy\setup_ubuntu24.sh, deploy\docker-compose.yml, `
+    deploy\docker-compose.ubuntu.yml, Dockerfile.ubuntu, deploy\.env.ubuntu, `
+    deploy\entrypoint.sh, deploy\verify_offline_image.py, deploy\verify_ubuntu_image.py, `
+    deploy\build_offline_image.sh, deploy\UBUNTU_DEPLOY.md `
     deliverable\deploy\ -Force
 
 Write-Host "== Deliverable ready ==" -ForegroundColor Green

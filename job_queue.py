@@ -271,8 +271,13 @@ class JobQueue:
             self._conn.commit()
             self._live[job_id] = threading.Event()
             token = self._live[job_id]
+            # Snapshot the accepted state here, still under the lock: a fresh
+            # read after handing the job to the worker races it, and a trivial
+            # job can already be finished by the time this returns.
+            row = self._conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            accepted = self._record(row, self._position(job_id), include_response=True)
         self._pending.put({"job_id": job_id, "endpoint": endpoint, "work": work, "cancel": token})
-        return self.get(job_id)
+        return accepted
 
     def record_inline(self, endpoint: str, work: Callable[[], Any], *, filename: str | None = None,
                       media_type: str | None = None, client: str | None = None,

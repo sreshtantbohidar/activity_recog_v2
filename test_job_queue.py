@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from job_queue import (CANCELLED, COMPLETED, FAILED, FINISHED, QUEUED, RUNNING, JobQueue,
                        JobQueueFull, report_progress)
@@ -87,6 +88,29 @@ class JobQueueTests(unittest.TestCase):
         self.assertEqual(finished[1]["response"], {"index": 1})
         self.assertEqual(finished[0]["http_status"], 200)
         self.assertIsNotNone(finished[0]["duration_seconds"])
+
+    def test_submit_reports_the_accepted_state_not_the_workers_progress(self):
+        """The record submit() returns must not depend on how fast the worker is.
+
+        On a busy host the worker can finish a trivial job before submit() reads the
+        row back; the caller is still being told its job was accepted, and that it
+        is first in line. Reading the row *after* handing the work over is what
+        makes that a race, so the read is slowed down here to force the loss.
+        """
+        queue = self.make_queue()
+        original_get = queue.get
+
+        def slow_get(job_id):
+            time.sleep(0.05)  # long enough for the trivial job to finish first
+            return original_get(job_id)
+
+        with patch.object(queue, "get", side_effect=slow_get):
+            record = queue.submit("/analyze-image", lambda: FakeResponse({"ok": True}))
+        self.assertEqual(record["status"], QUEUED, "submit() reported the worker's progress")
+        self.assertEqual(record["queue_position"], 1)
+        self.assertIsNone(record["total_seconds"], "an accepted job has no total time yet")
+        # The job really did complete while the slowed read was in flight.
+        self.assertEqual(wait_for(queue, record["job_id"])["status"], COMPLETED)
 
     def test_only_one_job_runs_at_a_time(self):
         queue = self.make_queue()

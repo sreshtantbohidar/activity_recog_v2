@@ -805,6 +805,11 @@ def analyze_video_audio(video_path: str, device: str = "cpu") -> Dict[str, Any]:
                 logger.exception("faster-whisper transcription failed; falling back to audio-model transcription")
                 result["warnings"].append(f"Whisper transcription unavailable: {exc}")
                 whisper_transcript = None
+            finally:
+                # The audio model is loaded for the pass below: the ASR model must
+                # not still be resident then. One model at a time is what keeps
+                # the request inside the card.
+                release_whisper()
 
         with _model_lock:
             try:

@@ -1,0 +1,3 @@
+FROM activity-recognition:2.0.1
+# Only the source files that changed: the layer stays a few hundred KB.
+COPY app.py swagger_docs.py detection_store.py test_swagger_docs.py test_detection_store.py /app/

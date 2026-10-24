@@ -94,7 +94,19 @@ and remains downloadable.
 ```sh
 curl -s -F file=@clip.mp4 localhost:5009/detect-objects-video
 curl -s localhost:5009/queue/<job_id> | jq '.response.object_detection | {frames_sampled, detected_object_counts, annotated_video_url}'
+
+# Save the run on a media record (the mode the legacy service always used):
+curl -s -H 'Content-Type: application/json' -d '{"id": 604}' localhost:5009/detect-objects-video
+# ...or attach an upload to one:
+curl -s -F id=604 -F file=@clip.mp4 localhost:5009/detect-objects-video
 ```
+
+Naming a record makes the job write `analysis_summary`, `output_file_path` and
+`status=1` on that `media_analysis` row, for an image and a video alike; without
+one the upload is not persisted. The write is best-effort: an unreachable
+database or an SFTP failure leaves the finished detection in the job response and
+reports the reason in `persistence_warning`, and a failed publish never blanks an
+`output_file_path` that already points at a working artefact.
 
 Statuses are `queued`, `running`, `completed` and `failed`. A job is `failed`
 when its work raised or produced a non-2xx response, with the reason in `error`.

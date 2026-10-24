@@ -19,7 +19,7 @@
 #     ollama) is holding VRAM, it is reported and the deploy stops
 set -euo pipefail
 
-TARGET="/home/demo/Music/activity-code-v3/activity_recog_v2"
+TARGET="/home/demo/deliverable/actvity_recog_v2"
 GPU_INDEX=""          # empty = auto-pick the card with most free VRAM
 ASSUME_YES=0
 OVERRIDE_UTIL=""
@@ -71,11 +71,17 @@ GPU_NAME=$(nvidia-smi -i "$IDX" --query-gpu=name --format=csv,noheader)
 info "GPU $IDX: $GPU_NAME  ${VRAM_MIB} MiB total, ${VRAM_FREE} MiB free"
 
 # Size the engine from free VRAM: weights ~7.5 GB + KV cache + audio headroom.
+# On a 16 GB card that means the whole card (0.92 = 14.35 GiB of 15.6 GiB): the
+# weights alone load 7.37 GiB and the memory profile peaks at ~13.75 GiB, which
+# leaves only 0.60 GiB of KV cache. The engine therefore cannot start while the
+# API's audio stack (~5 GB, loaded in the API process on the same card) is
+# resident, so engine_power.sleep_now() releases it before the entrypoint
+# supervisor's restart - that release path is what keeps the service up.
 if [[ -n "$OVERRIDE_UTIL" ]]; then
   GPU_UTIL="$OVERRIDE_UTIL"
 elif   (( VRAM_FREE >= 40000 )); then GPU_UTIL=0.85     # A6000 48 GB
 elif   (( VRAM_FREE >= 22000 )); then GPU_UTIL=0.80     # Blackwell 24 GB
-elif   (( VRAM_FREE >= 14000 )); then GPU_UTIL=0.80     # A4000 16 GB
+elif   (( VRAM_FREE >= 14000 )); then GPU_UTIL=0.92     # A4000 16 GB; engine owns the card
 elif   (( VRAM_FREE >= 10000 )); then GPU_UTIL=0.60     # shared / small card
 else die "GPU $IDX has only ${VRAM_FREE} MiB free; the engine alone needs >= 10 GB. Stop the other GPU processes and retry."
 fi
@@ -92,7 +98,10 @@ else
     TAR_FILE=$(ls "$HERE_TAR"/activity-recognition-*.tar "$HERE_TAR"/../activity-recognition-*.tar 2>/dev/null | head -1 || true)
   fi
   [[ -n "$TAR_FILE" && -f "$TAR_FILE" ]] || die "image not loaded and no tar found - copy activity-recognition-*.tar from the deliverable folder and pass --tar FILE"
-  [[ -f "${TAR_FILE}.md5" ]] && { info "verifying md5"; (cd "$(dirname "$TAR_FILE")" && md5sum -c "$(basename "$TAR_FILE").md5") || die "tar checksum mismatch - re-copy from the HDD"; }
+  CHECKSUM_FILE="$(dirname "$TAR_FILE")/SHA256SUMS"
+  [[ -f "$CHECKSUM_FILE" ]] || die "missing SHA256SUMS next to the image tar"
+  info "verifying SHA-256"
+  (cd "$(dirname "$TAR_FILE")" && sha256sum -c SHA256SUMS) || die "tar checksum mismatch - re-copy from the HDD"
   info "loading $(basename "$TAR_FILE") (several minutes)"
   docker load -i "$TAR_FILE" || die "docker load failed"
 fi
@@ -103,19 +112,11 @@ say "Preparing $TARGET"
 mkdir -p "$TARGET/reports" "$TARGET/config" "$TARGET/secrets" "$TARGET/testvideos" "$TARGET/logs"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Deploy assets are copied next to this script by transfer_image.ps1.
-for f in docker-compose.yml docker-compose.ubuntu.yml .env.ubuntu verify_offline_image.py; do
+for f in docker-compose.yml docker-compose.ubuntu.yml Dockerfile.ubuntu .env.ubuntu verify_ubuntu_image.py; do
   [[ -f "$HERE/$f" ]] && cp -f "$HERE/$f" "$TARGET/" && info "copied $f"
 done
 [[ -f "$HERE/entrypoint.sh" ]] && cp -f "$HERE/entrypoint.sh" "$TARGET/"
 [[ -f "$TARGET/secrets/id_ed25519" ]] || info "NOTE: no $TARGET/secrets/id_ed25519 - SFTP delivery (/detect-objects) will return 502 until added"
-
-# Compose asks for a rebuildable image; the override pins the transferred one.
-cat > "$TARGET/docker-compose.ubuntu.yml" <<'YAML'
-services:
-  activity-recognition:
-    image: activity-recognition:2.0.0
-    build: !reset null
-YAML
 
 # 4. Environment -----------------------------------------------------------------------
 say "Writing .env"

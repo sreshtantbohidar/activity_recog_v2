@@ -15,7 +15,10 @@
 #
 # The engine is SUPERVISED: a CUDA fault on a particular multimodal input can
 # kill the EngineCore process, and without a supervisor the API would be left
-# without vision until the container was restarted by hand.
+# without vision until the container was restarted by hand. A restart also
+# waits for the engine's GPU memory budget first (gpu_vram_gate.py): while
+# another process holds the card, loading 7.4 GiB of weights would only fail
+# vLLM's free-memory check again.
 set -u
 
 MODEL="${VLLM_MODEL_ID:-cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit}"
@@ -52,10 +55,20 @@ stop_engine() {
 }
 trap stop_engine INT TERM
 
+# Wait until the card can hold the engine. The gate opens as soon as the
+# memory is free again and never gives up, so a restart is attempted only
+# when it can succeed. A container without the gate script still starts.
+wait_for_vram() {
+  [ -f /app/gpu_vram_gate.py ] || return 0
+  python3 /app/gpu_vram_gate.py --util "${VLLM_GPU_MEMORY_UTILIZATION:-0.80}" \
+    --interval 5 --max-wait 0
+}
+
 # Supervise the engine in the background: restart it whenever it exits so a
 # crashed EngineCore is replaced automatically instead of taking vision down.
 supervise() {
   while :; do
+    if ! wait_for_vram; then break; fi
     start_engine
     wait "$ENGINE_PID" 2>/dev/null || true
     if [ "$SHUTDOWN" = "1" ]; then break; fi

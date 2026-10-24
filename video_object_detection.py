@@ -173,6 +173,7 @@ def annotate_with_detections(model, source_path, destination_path, *,
     track_list, counts = summarize_tracks(tracks)
     tracks_truncated = len(track_list) > max_tracks
     track_list = track_list[:max(1, max_tracks)]
+
     return {
         "frames_analyzed": frames,
         "frames_annotated": frames,

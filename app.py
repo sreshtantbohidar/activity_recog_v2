@@ -25,6 +25,7 @@ from werkzeug.exceptions import HTTPException
 
 from audio_analysis import (AUDIO_STAGE_LOCK, QWEN_AUDIO_MODEL_ID, analyze_video_audio,
     cadence_activity_bias, release_qwen_audio, sound_event_cadence_bias)
+from detection_store import save_detection
 from engine_power import EnginePowerManager
 from gpu_monitor import build_snapshot as gpu_snapshot
 from gpu_monitor import engine_memory_mib, find_engine_server_pid
@@ -37,7 +38,7 @@ from media_utils import CONFIDENCE_LEVELS, MediaProbeError, VideoTooLongError, a
 from swagger_docs import (ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC, ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC,
     ANALYZE_VIDEO_DETAILED_SWAGGER_DOC,
     DOWNLOAD_REPORT_SWAGGER_DOC, DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC,
-    DETECT_OBJECTS_VIDEO_SWAGGER_DOC,
+    DETECT_OBJECTS_VIDEO_SWAGGER_DOC, DJANGO_VIDEO_OBJECT_DETECTION_TAG,
     GET_CONFIG_SWAGGER_DOC, SET_CONFIG_SWAGGER_DOC,
     DETECT_OBJECTS_SWAGGER_DOC, FETCH_MEDIA_SWAGGER_DOC, GET_VISION_BACKEND_SWAGGER_DOC,
     GET_QUEUE_SWAGGER_DOC, GET_QUEUE_JOB_SWAGGER_DOC, GPU_MONITOR_SWAGGER_DOC,
@@ -307,13 +308,19 @@ def _ensure_decodable_video(path):
     codec = _video_codec(path)
     if codec in SUPPORTED_VIDEO_CODECS:
         return codec
-    target = path.with_name(f"{path.stem}_decoded{path.suffix}")
+    # The target is an MP4 whatever the source container was: H.264/AAC cannot
+    # be muxed into WebM, so keeping the original suffix made ffmpeg refuse
+    # ("Only VP8 or VP9 or AV1 video ... supported for WebM") and every .webm
+    # upload failed before detection -- leaving its media row unsaved. The
+    # result replaces the source in place, so later stages and replays keep
+    # using the same path.
+    target = path.with_name(f"{path.stem}_decoded.mp4")
     report_progress(2, f"converting {codec or 'unsupported'} video")
     try:
         completed = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y",
             "-i", str(path), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart", str(target)],
+            "-movflags", "+faststart", "-f", "mp4", str(target)],
             text=True, capture_output=True, timeout=1800, check=False)
     except Exception as exc:
         target.unlink(missing_ok=True)
@@ -1059,7 +1066,7 @@ def analyze_video_detailed_file(path, original_filename=None):
 app = Flask(__name__, template_folder=str(BASE_DIR/"templates")); app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 CORS(app, resources={r"/analyze-*":{"origins":os.getenv("CORS_ORIGINS","*")}})
 Swagger(app, template={"swagger":"2.0","info":{"title":"Activity Recognition API","version":"2.0.0",
-    "description":"Single-container activity recognition: in-container vLLM (Qwen3-VL-8B int4) and Qwen2.5-Omni audio"}}, config={"headers":[],"specs":[{"endpoint":"apispec",
+    "description":"Single-container activity recognition: in-container vLLM (Qwen3-VL-8B int4) and Qwen2.5-Omni audio"}, "tags": [DJANGO_VIDEO_OBJECT_DETECTION_TAG]}, config={"headers":[],"specs":[{"endpoint":"apispec",
     "route":"/apispec.json","rule_filter":lambda rule:True,"model_filter":lambda tag:True}],"swagger_ui":True,
     "specs_route":"/docs/","static_url_path":"/flasgger_static"})
 
@@ -1427,8 +1434,8 @@ def health_components():
 _UNIT_TEST_LOCK = threading.Lock()
 _UNIT_TEST_MODULES = ("test_audio_analysis", "test_job_queue", "test_media_utils",
     "test_engine_power", "test_vram_gate", "test_gpu_monitor", "test_vision_backend_vllm",
-    "test_response_schema", "test_video_object_detection", "test_feature_guard",
-    "test_swagger_docs")
+    "test_response_schema", "test_video_object_detection", "test_detection_store",
+    "test_feature_guard", "test_swagger_docs")
 
 
 class _CaseRecorder(unittest_result.TestResult):
@@ -1640,12 +1647,59 @@ def _queued_detailed_video_analysis(path, name):
     payload = {"filename":name,"media_type":"video","analysis":analyze_video_detailed_file(path, name)}
     return jsonify(validate_and_repair(payload, DETAILED_VIDEO_ANALYSIS_ENVELOPE_SCHEMA))
 
-def _queued_object_detection(path, name):
-    """Queued body for the upload mode of /detect-objects; the queue owns the upload."""
+def _form_record_id():
+    """Optional media_analysis.id sent as a form field with a detection upload.
+
+    An upload has no row of its own, so the caller names the record the result
+    belongs to. A malformed value is rejected on the request (400) instead of
+    being queued only to fail on the worker.
+    """
+    raw = (request.form.get("id") or "").strip()
+    if not raw: return None
+    try: return int(raw)
+    except ValueError: raise ValueError("'id' must be an integer media_analysis id")
+
+def _persist_detection(record_id, result, artifact=None):
+    """Save a detection on its media_analysis row; see detection_store.
+
+    The pool and the publisher are the app's own, so the shared contract stays
+    free of Flask and psycopg2 imports.
+    """
+    return save_detection(record_id, result, artifact,
+        cursor_factory=db_cursor, publish_fn=publish)
+
+def _persistence_fields(record_id, result, artifact=None):
+    """Response fields that report where a detection was saved."""
+    output_url, warning = _persist_detection(record_id, result, artifact)
+    fields = {"id": record_id, "status": 1}
+    if output_url: fields["output_file_path"] = output_url
+    if warning: fields["persistence_warning"] = warning
+    return fields
+
+def _encoded_image_file(result):
+    """Write detector.detect's inline JPEG to disk so it can be published."""
+    encoded = result.get("annotated_image_base64")
+    if not encoded: return None
+    artifact = Path(tempfile.gettempdir())/f"detected_{uuid.uuid4().hex}.jpg"
+    artifact.write_bytes(base64.b64decode(encoded))
+    return str(artifact)
+
+def _queued_object_detection(path, name, record_id=None):
+    """Queued body for the upload mode of /detect-objects; the queue owns the upload.
+
+    ``record_id`` (the optional ``id`` form field) saves the run on that
+    media_analysis row, exactly as the DB-driven mode does.
+    """
     report_progress(20, "detecting objects")
     result = detector.detect(path)
     report_progress(90, "encoding annotation")
-    return jsonify({"filename":name,"object_detection":result})
+    payload = {"filename":name,"object_detection":result}
+    if record_id is not None:
+        artifact = _encoded_image_file(result)
+        try: payload.update(_persistence_fields(record_id, result, artifact))
+        finally:
+            if artifact: Path(artifact).unlink(missing_ok=True)
+    return jsonify(payload)
 
 def _absolute_base_url(base_url=None):
     """Base URL for links inside a queued response.
@@ -1659,7 +1713,7 @@ def _absolute_base_url(base_url=None):
     configured = os.getenv("PUBLIC_BASE_URL", "").strip() or (base_url or "").strip()
     return configured.rstrip("/")
 
-def _queued_video_object_detection(path, name, base_url=None):
+def _queued_video_object_detection(path, name, base_url=None, record_id=None):
     """Queued body for /detect-objects-video; the queue owns the upload.
 
     The response carries the annotated clip three ways: the container path
@@ -1667,6 +1721,12 @@ def _queued_video_object_detection(path, name, base_url=None):
     (``annotated_video_url``), and an absolute HTTP URL that fetches the file as
     an attachment (``annotated_video_download_url``). Clients that do not know
     the service origin use the last one.
+
+    ``record_id`` (the optional ``id`` form field) also saves the run on that
+    media_analysis row: the same analysis_summary / output_file_path / status
+    update the DB-driven mode performs. The served clip is published to SFTP as
+    well as kept locally, so the row points at the same kind of URL an image row
+    does.
     """
     report_progress(10, "opening video")
     result = detector.detect_video(path)
@@ -1675,7 +1735,12 @@ def _queued_video_object_detection(path, name, base_url=None):
     if relative:
         result["annotated_video_download_url"] = \
             f"{_absolute_base_url(base_url)}{relative}?download=1"
-    return jsonify({"filename":name,"media_type":"video","object_detection":result})
+    payload = {"filename":name,"media_type":"video","object_detection":result}
+    if record_id is not None:
+        local = object_video_dir()/Path(relative).name if relative else None
+        artifact = str(local) if local and local.exists() else None
+        payload.update(_persistence_fields(record_id, result, artifact))
+    return jsonify(payload)
 
 # How a replay rebuilds a request from a retained upload, per endpoint.
 _REPLAY_BODIES = {"/analyze-image":_queued_image_analysis, "/analyze-video":_queued_video_analysis,
@@ -1871,9 +1936,12 @@ def _write_annotated_artifact(source_path):
     """Render the annotated artefact for `source_path`; returns (path, result)."""
     logger.info("Detecting objects in %s (%s bytes)", source_path, os.path.getsize(source_path))
     if Path(source_path).suffix.lower() in VIDEO_EXTENSIONS:
-        artifact = Path(tempfile.gettempdir())/f"detected_{uuid.uuid4().hex}.mp4"
-        # annotate_video drives the bar across the frame loop (20-90%).
-        return str(artifact), detector.annotate_video(source_path, artifact)
+        # The DB-driven video mode must return the same evidence the upload mode
+        # does: annotate_video only counts frames, so the row used to be saved
+        # with no detections/tracks at all. detect_video also writes the clip to
+        # the retained object-videos directory and transcodes it for the web.
+        result = detector.detect_video(source_path)
+        return result["annotated_video_path"], result
     report_progress(35, "detecting objects")
     normalized = _normalize_for_detection(source_path)
     try:
@@ -1891,6 +1959,7 @@ def detect_objects_by_id(record_id):
     """Resolve a media_analysis row by id, detect objects, publish the annotated
     artefact over SFTP and record its URL: the legacy /detect-objects contract."""
     source = artifact = None
+    is_video = False
     with db_cursor() as (conn, cursor):
         cursor.execute("SELECT file_path, media_type FROM public.media_analysis WHERE id = %s", (record_id,))
         row = cursor.fetchone()
@@ -1903,7 +1972,8 @@ def detect_objects_by_id(record_id):
             report_progress(4, "downloading media")
             source = _fetch_remote_media(media_value, Path(parsed.path).suffix.lower())
             report_progress(15, "media downloaded")
-            if Path(source).suffix.lower() in VIDEO_EXTENSIONS:
+            is_video = Path(source).suffix.lower() in VIDEO_EXTENSIONS
+            if is_video:
                 # The same ceiling the upload endpoints enforce. The limit is purely
                 # duration-based so an over-long video is rejected outright instead of
                 # yielding a silently truncated annotation.
@@ -1911,15 +1981,18 @@ def detect_objects_by_id(record_id):
             artifact, result = _write_annotated_artifact(source)
             report_progress(93, "publishing artefact")
             output_url = publish(artifact, media_type)
-            cursor.execute("UPDATE public.media_analysis SET analysis_summary=%s, output_file_path=%s, status=%s WHERE id=%s",
-                (json.dumps(result), output_url, 1, record_id))
+            cursor.execute("UPDATE public.media_analysis SET analysis_summary=%s, response_data=%s, output_file_path=%s, status=%s WHERE id=%s",
+                (json.dumps(result), json.dumps(result), output_url, 1, record_id))
             conn.commit()
         except Exception:
             logger.exception("DB-driven /detect-objects failed for media_analysis.id=%s", record_id)
             raise
         finally:
-            for candidate in (source, artifact):
-                if candidate: Path(candidate).unlink(missing_ok=True)
+            if source: Path(source).unlink(missing_ok=True)
+            # Video artefacts live under the reports volume and are kept so the
+            # URLs in the saved result stay downloadable; image artefacts are
+            # one-off temp files and are removed after publishing.
+            if artifact and not is_video: Path(artifact).unlink(missing_ok=True)
     return jsonify({"id":record_id,"status":1,"object_detection":result})
 
 @app.route("/detect-objects", methods=["POST"])
@@ -1933,37 +2006,45 @@ def detect_objects_api():
         return _enqueue("/detect-objects", lambda: detect_objects_by_id(record_id),
             media_type="db-record", detail=f"media_analysis.id={record_id}",
             input_ref=json.dumps({"id":record_id}))
+    record_id = _form_record_id()
     path, name = _stage_image_upload()
     # Detection is the only cv2-based path, so the re-encode belongs here rather
     # than in the shared image staging used by the vLLM endpoints.
     path = _ensure_opencv_readable(path)
-    return _enqueue("/detect-objects", lambda: _queued_object_detection(path, name),
+    return _enqueue("/detect-objects", lambda: _queued_object_detection(path, name, record_id),
         filename=name, media_type="image", input_path=path)
 
 @app.route("/detect-objects-video", methods=["POST"])
 @swag_from(DETECT_OBJECTS_VIDEO_SWAGGER_DOC)
 def detect_objects_video_api():
-    """Queue object detection/tracking for an uploaded video.
-
-    The upload is validated (extension + five-minute duration ceiling) on the
-    request so a bad clip still fails immediately; annotation and tracking run
-    on the single queue worker.
-    """
+    """Queue video object detection for an uploaded clip or a media_analysis record."""
+    # The upload is validated (extension + five-minute duration ceiling) on the
+    # request so a bad clip still fails immediately; annotation and tracking run
+    # on the single queue worker. Like /detect-objects it also accepts the
+    # DB-driven form {"id": n}, which resolves the clip from public.media_analysis,
+    # annotates it and saves the result back on the row -- the contract the legacy
+    # service had for both images and videos. An upload can name a row with the
+    # optional id form field to get the same save.
+    body = request.get_json(silent=True) if request.is_json else None
+    if isinstance(body, dict) and body.get("id") is not None:
+        record_id = body["id"]
+        return _enqueue("/detect-objects-video", lambda: detect_objects_by_id(record_id),
+            media_type="db-record", detail=f"media_analysis.id={record_id}",
+            input_ref=json.dumps({"id":record_id}))
+    record_id = _form_record_id()
     path, name = _stage_video_upload()
     base_url = request.host_url
     return _enqueue("/detect-objects-video",
-        lambda: _queued_video_object_detection(path, name, base_url),
+        lambda: _queued_video_object_detection(path, name, base_url, record_id),
         filename=name, media_type="video", input_path=path)
 
 @app.route("/object-videos/<path:filename>", methods=["GET"])
 @swag_from(DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC)
 def download_object_video(filename):
-    """Serve an annotated clip written by /detect-objects-video.
-
-    ``?download=1`` sends it as an attachment, which is what the absolute
-    ``annotated_video_download_url`` in the job response uses. Without the flag
-    the clip is served inline so the dashboard can play it.
-    """
+    """Serve an annotated clip written by /detect-objects-video."""
+    # ``?download=1`` sends it as an attachment, which is what the absolute
+    # ``annotated_video_download_url`` in the job response uses. Without the flag
+    # the clip is served inline so the dashboard can play it.
     return send_from_directory(str(object_video_dir()), filename,
         as_attachment=request.args.get("download") == "1")
 
@@ -1985,4 +2066,4 @@ def unhandled(exc):
         return jsonify({"error":exc.description}),exc.code
     logger.exception("Unhandled request failure"); return jsonify({"error":"Internal server error"}),500
 
-if __name__ == "__main__": app.run(host="0.0.0.0",port=5009,debug=False)
+if __name__ == "__main__": app.run(host="0.0.0.0",port=5004,debug=False)

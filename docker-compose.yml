@@ -7,7 +7,7 @@ services:
       context: .
       args:
         PRELOAD_MODELS: ${PRELOAD_MODELS:-0}
-    image: activity-recognition:2.0.0
+    image: activity-recognition:2.0.1
     ports:
       - "${ACTIVITY_PORT:-5009}:5009"
     environment:
@@ -130,6 +130,12 @@ services:
     shm_size: "2gb"
     volumes:
       - huggingface-cache:/models/huggingface
+      # HuggingFace runtime cache. The app resolves both models by repo id
+      # (QWEN_AUDIO_MODEL_ID / VLLM_MODEL_ID), so this cache grows to ~16 GB.
+      # It must live on a volume: inside the container filesystem every
+      # `docker commit` copies those 16 GB into a new image layer, which is
+      # what made the images grow on each commit.
+      - hf-cache:/app/hf_cache
       - ./reports:/app/reports
       - ./config:/app/config
       # Queue history and staged uploads. A named volume (rather than a bind
@@ -153,5 +159,10 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
 volumes:
+  hf-cache:
+    # Created before the first compose run (it already holds the 16 GB the
+    # old container had in its writable layer), so compose must not manage it.
+    external: true
+    name: actvity_recog_v2_hf-cache
   huggingface-cache:
   activity-data:

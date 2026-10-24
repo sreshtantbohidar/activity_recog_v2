@@ -11,7 +11,7 @@
 param(
     [string]$UbuntuHost = "192.168.1.125",
     [string]$UbuntuUser = "demo",
-    [string]$TargetDir  = "/home/demo/Music/activity-code-v3/activity_recog_v2"
+    [string]$TargetDir  = "/home/demo/deliverable/actvity_recog_v2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,7 +45,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "== Copying deploy assets (compose + env + scripts + runbook) ==" -ForegroundColor Cyan
 ssh "$UbuntuUser@$UbuntuHost" "mkdir -p $TargetDir/deploy"
-scp deploy\docker-compose.yml, deploy\docker-compose.ubuntu.yml, deploy\.env.ubuntu, `
+scp deploy\docker-compose.yml, deploy\docker-compose.ubuntu.yml, Dockerfile.ubuntu, deploy\.env.ubuntu, `
     deploy\entrypoint.sh, deploy\verify_offline_image.py, deploy\deploy_ubuntu.sh, deploy\UBUNTU_DEPLOY.md `
     "${UbuntuUser}@${UbuntuHost}:${TargetDir}/deploy/"
 if ($LASTEXITCODE -ne 0) { throw "Copying deploy assets failed." }

@@ -17,7 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg fonts-dejavu-core gcc g++ libgl1 libglib2.0-0 libgomp1 libsndfile1 \
+        ca-certificates curl ffmpeg gcc g++ libgl1 libglib2.0-0 libgomp1 libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -47,11 +47,9 @@ RUN test -s /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit/config.json \
     && test -s /app/app.py \
     && test -s /app/entrypoint.sh \
     && mkdir -p /app/logs /app/tmp /app/reports /app/config /app/segments \
-        /app/secrets /app/data /app/hf_cache /home/app /tmp/triton /tmp/ultralytics \
-    && ln -sf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
-        /tmp/ultralytics/Arial.Unicode.ttf \
+        /app/secrets /app/data /app/hf_cache /home/app /tmp/triton \
     && chown -R 65532:65532 /app/logs /app/tmp /app/reports /app/config \
-        /app/segments /app/secrets /app/data /app/hf_cache /home/app /tmp/triton /tmp/ultralytics \
+        /app/segments /app/secrets /app/data /app/hf_cache /home/app /tmp/triton \
     && sed -i 's/\r$//' /app/entrypoint.sh /app/deploy/*.sh \
     && chmod +x /app/entrypoint.sh \
     && echo "app:x:65532:65532:Activity Service:/home/app:/bin/false" >> /etc/passwd \

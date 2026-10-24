@@ -8,6 +8,7 @@ from swagger_docs import (
     ANALYZE_VIDEO_DETAILED_SWAGGER_DOC,
     DETECT_OBJECTS_SWAGGER_DOC,
     DETECT_OBJECTS_VIDEO_SWAGGER_DOC,
+    DJANGO_VIDEO_OBJECT_DETECTION_TAG,
     DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC,
     DOWNLOAD_REPORT_SWAGGER_DOC,
     GET_CONFIG_SWAGGER_DOC,
@@ -107,17 +108,77 @@ class SwaggerOperationDocsTests(unittest.TestCase):
         self.assertIn("202", RELOAD_QUEUE_JOB_SWAGGER_DOC["responses"])
         self.assertIn("bounded", RELOAD_QUEUE_JOB_SWAGGER_DOC["description"])
 
+
+    def test_django_video_section_names_who_does_each_step(self):
+        tag = DJANGO_VIDEO_OBJECT_DETECTION_TAG
+        self.assertEqual(tag["name"], "Django Video Object Detection")
+        description = tag["description"]
+        # Ordered steps with an explicit owner, so Django and the React UI each know their part.
+        for marker in ("STEP 1 - REACT (UI)", "STEP 2 - DJANGO", "STEP 3 - THIS SERVICE",
+                       "STEP 4 - REACT (UI)", "STEP 5 - DJANGO (DATABASE)",
+                       "STEP 6 - REACT (UI)", "STEP 7 - OTHER CONSUMERS"):
+            self.assertIn(marker, description)
+        for endpoint in ("/ai-analysis/media-analysis/upload/",
+                         "/ai-analysis/media-analysis/retrive/{id}/", "/queue/{job_id}"):
+            self.assertIn(endpoint, description)
+        self.assertIn("status=1", description)
+        self.assertIn("response_data", description)
+        self.assertIn("CORS", description)
+        self.assertIn("output_file_path", description)
+        # The URL map names every hop, including the one Django makes to this service.
+        self.assertIn("URL MAP, IN ORDER", description)
+        self.assertIn("[REACT]  POST  https://<django-host>/ai-analysis/media-analysis/upload/", description)
+        self.assertIn("[DJANGO] POST  http://<this-host>:5009/detect-objects-video", description)
+        self.assertIn("Django makes exactly ONE call to this service", description)
+        # The video endpoints live in that section so Swagger UI renders it.
+        self.assertEqual(DETECT_OBJECTS_VIDEO_SWAGGER_DOC["tags"], [tag["name"]])
+        self.assertEqual(DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC["tags"], [tag["name"]])
+        source = Path(__file__).with_name("app.py").read_text()
+        self.assertIn('"tags": [DJANGO_VIDEO_OBJECT_DETECTION_TAG]', source)
+
     def test_video_object_detection_documents_sampling_and_artefact(self):
         # The counterpart of /detect-objects: queued, bounded evidence, and an
         # annotated clip served back through a read-only route.
         for code in ("202", "400", "413", "503"):
             self.assertIn(code, DETECT_OBJECTS_VIDEO_SWAGGER_DOC["responses"])
-        self.assertEqual(DETECT_OBJECTS_VIDEO_SWAGGER_DOC["consumes"], ["multipart/form-data"])
+        self.assertIn("multipart/form-data", DETECT_OBJECTS_VIDEO_SWAGGER_DOC["consumes"])
         self.assertIn("sampled", DETECT_OBJECTS_VIDEO_SWAGGER_DOC["description"])
         self.assertIn("bounded", DETECT_OBJECTS_VIDEO_SWAGGER_DOC["description"])
         self.assertIn("annotated_video_url", DETECT_OBJECTS_VIDEO_SWAGGER_DOC["description"])
         self.assertIn("404", DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC["responses"])
         self.assertEqual(DOWNLOAD_OBJECT_VIDEO_SWAGGER_DOC["produces"], ["video/mp4"])
+
+    def test_video_object_detection_documents_the_database_save(self):
+        # The video endpoint mirrors /detect-objects: an upload, or a
+        # media_analysis id that makes the run save itself back on the row.
+        operation = DETECT_OBJECTS_VIDEO_SWAGGER_DOC
+        # JSON must come first so Swagger UI defaults to the id mode; multipart
+        # remains selectable and requires a file.
+        self.assertEqual(operation["consumes"], ["application/json", "multipart/form-data"])
+        parameters = {parameter["name"]: parameter for parameter in operation["parameters"]}
+        self.assertEqual(parameters["file"]["in"], "formData")
+        self.assertEqual(parameters["file"]["type"], "file")
+        # The file is optional because the DB-driven mode has no upload.
+        self.assertFalse(parameters["file"]["required"])
+        self.assertEqual(parameters["id"]["in"], "body")
+        self.assertEqual(parameters["id"]["schema"]["properties"]["id"]["type"], "integer")
+        self.assertIn("analysis_summary", operation["description"])
+        self.assertIn("persistence_warning", operation["description"])
+        self.assertIn("404", operation["responses"])
+
+    def test_video_object_detection_documents_the_async_save_workflow(self):
+        """The caller must know one POST starts the work and when the row lands."""
+        operation = DETECT_OBJECTS_VIDEO_SWAGGER_DOC
+        description = operation["description"]
+        self.assertIn("Poll GET /queue/{job_id}", description)
+        self.assertIn("No second API call", description)
+        self.assertIn("status=1", description)
+        self.assertIn("Parameter content type", description)
+        accepted = operation["responses"]["202"]["schema"]["properties"]
+        self.assertIn("job_id", accepted)
+        self.assertIn("status_url", accepted)
+        # Polling reports the job; the completion of the job is what saved the row.
+        self.assertIn("already been updated", GET_QUEUE_JOB_SWAGGER_DOC["description"])
 
     def test_dashboard_offers_a_video_object_detection_tab(self):
         for name in ("templates/dashboard.html", "dashboard.html"):
@@ -129,7 +190,7 @@ class SwaggerOperationDocsTests(unittest.TestCase):
 
     def test_upload_apis_document_multipart_file_parameter(self):
         for operation in (ANALYZE_IMAGE_UPLOAD_SWAGGER_DOC, ANALYZE_VIDEO_UPLOAD_SWAGGER_DOC,
-                          ANALYZE_VIDEO_DETAILED_SWAGGER_DOC, DETECT_OBJECTS_VIDEO_SWAGGER_DOC):
+                          ANALYZE_VIDEO_DETAILED_SWAGGER_DOC):
             self.assertEqual(operation["consumes"], ["multipart/form-data"])
             file_param = operation["parameters"][0]
             self.assertEqual(file_param["name"], "file")

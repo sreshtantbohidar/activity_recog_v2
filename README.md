@@ -82,6 +82,7 @@ gone reports `409`.
 | `POST` | `/analyze-video` | Vision + audio analysis of an uploaded video *(queued)* |
 | `POST` | `/analyze-video-detailed` | Detailed video analysis with tracking and PDF *(queued)* |
 | `POST` | `/detect-objects` | YOLO detection, by upload or by `media_analysis.id` *(queued)* |
+| `POST` | `/detect-objects-video` | YOLO tracking over a video, by upload or by `media_analysis.id` *(queued)* |
 | `POST` | `/fetch-media` | Pull and analyze media from a remote source *(inline)* |
 | `GET` | `/queue` | Queue depth plus a page of jobs |
 | `GET` | `/queue/<job_id>` | One job's status, progress, timings and response |
@@ -89,6 +90,15 @@ gone reports `409`.
 | `DELETE` | `/queue` | Clear all finished jobs |
 | `POST` | `/queue/<job_id>/cancel` | Cancel a queued or running job |
 | `POST` | `/queue/<job_id>/reload` | Re-queue a job from its recorded input |
+
+Both detection endpoints save their run to `public.media_analysis` when the
+request names a record: the JSON body `{"id": n}` for the DB-driven mode, or an
+optional `id` form field beside an upload. The row receives `analysis_summary`,
+`output_file_path` (the published artefact) and `status=1` — the contract the
+legacy service had for images and videos alike. The save is best-effort, so a
+database or SFTP problem is reported as `persistence_warning` in the job response
+instead of discarding a detection that already finished; without an `id` an upload
+is not saved, exactly as before.
 
 Swagger UI is served at `/docs/`, and `swagger_docs.py` holds the operation
 definitions.
@@ -164,6 +174,18 @@ status codes. Point it at a deployment with `E2E_BASE` and a fixture folder with
 
 ```sh
 python3 e2e_live.py            # 19 checks against http://127.0.0.1:5009
+```
+
+`ui-tests/compare_panel.js` renders the dashboard in jsdom and drives the
+object-detection UI with real payload shapes, asserting that both detection tabs
+show the uploaded file next to the annotated result and that the analytics view
+does not duplicate the media. It needs Node and jsdom, and runs against either
+the template or a served page:
+
+```sh
+npm install --no-save jsdom
+node ui-tests/compare_panel.js dashboard.html
+curl -s http://127.0.0.1:5009/ > served.html && node ui-tests/compare_panel.js served.html
 ```
 
 `check_analytics.py`, `make_harness.py` and `run_harness.py` are development

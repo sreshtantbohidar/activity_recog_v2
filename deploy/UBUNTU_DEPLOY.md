@@ -8,7 +8,7 @@ Windows (.16, build host)                external HDD          Ubuntu (any host)
 ┌────────────────────────────┐                                ┌──────────────────────────────┐
 │ deploy\build_offline_...ps1│   copy deliverable\ folder     │ deliverable\deploy\...       │
 │  1. prefetch models        │  ────────── HDD ──────────►    │ deploy_ubuntu.sh             │
-│  2. docker build (COPY)    │   (~20 GB tar + md5 + assets)  │  loads tar, detects GPU,     │
+│  2. docker build (COPY)    │   (~42 GB tar + SHA-256)       │  loads tar, detects GPU,     │
 │  3. verify offline         │                                │  writes .env, waits health   │
 │  4. export deliverable\    │                                └──────────────────────────────┘
 └────────────────────────────┘
@@ -22,19 +22,20 @@ layer of the image, so `docker load` is the only thing the Ubuntu host needs:
 | Component | Baked at | Purpose |
 |---|---|---|
 | vLLM 0.11 + torch 2.8 (cu128) | image packages | vision engine runtime |
-| Qwen3-VL-8B-Instruct-AWQ-4bit | HF cache layer | frame analysis (vLLM) |
-| Qwen2.5-Omni-3B | HF cache layer | sound description (Thinker, text-only) |
-| faster-whisper large-v3 | `/opt/whisper` | speech transcription (ASR) |
+| Qwen3-VL-8B-Instruct-AWQ-4bit | `/app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit` | frame analysis (vLLM) |
+| Qwen2.5-Omni-3B | `/app/hf_models/Qwen2.5-Omni-3B` | sound description |
+| faster-whisper large-v3 | `/app/whisper_models/faster-whisper-large-v3` | speech transcription (ASR) |
 | YOLO 256-class weights | `/app/object_detect_model_256_class.pt` | object detection |
+| DejaVu Sans | `/tmp/ultralytics/Arial.Unicode.ttf` | offline annotation labels |
 
-The build script refuses to bless the image until `verify_offline_image.py`
-passes **inside it**: library imports, the Omni classes, the whisper files, all
-three HF checkpoints, and offline (`HF_HUB_OFFLINE=1`) resolution of each.
+The build script refuses to export the image until `verify_ubuntu_image.py`
+passes inside a container with networking disabled. It checks library imports,
+application files, all model weights, and offline Hugging Face resolution.
 
 ## Step 1 — Build (Windows host)
 
 ```powershell
-cd C:\Users\Hp\projects\activity_recog_v2
+cd D:\work\tectum\activity-recognition\activity_recog_v2
 powershell -ExecutionPolicy Bypass -File deploy\build_offline_image.ps1
 ```
 
@@ -48,15 +49,15 @@ powershell -ExecutionPolicy Bypass -File deploy\build_offline_image.ps1
 
 ```
 deliverable\
-├── activity-recognition-2.0.0-offline.tar        (~20 GB image, all models)
-├── activity-recognition-2.0.0-offline.tar.md5    checksum the deploy verifies
+├── activity-recognition-2.0.0-offline.tar        (~42 GB image, all models)
+├── SHA256SUMS                                    checksum the deploy verifies
 └── deploy\
     ├── deploy_ubuntu.sh        <- run this on the Ubuntu host
     ├── docker-compose.yml
     ├── docker-compose.ubuntu.yml   (pins the image, no build, no HF volume)
     ├── .env.ubuntu
     ├── entrypoint.sh
-    ├── verify_offline_image.py
+    ├── verify_ubuntu_image.py
     └── UBUNTU_DEPLOY.md           (this runbook)
 ```
 
@@ -78,7 +79,13 @@ chmod +x deploy_ubuntu.sh
 ```
 
 The script loads `activity-recognition-2.0.0-offline.tar` from the deliverable
-folder (verifying its md5 first), then continues automatically.
+folder (verifying its SHA-256 first), then continues automatically.
+
+The Linux profile sets `VLLM_MAX_NUM_SEQS=1` because the application queue
+serializes GPU work. This avoids reserving encoder/KV cache for concurrency the
+service never uses and leaves room for the audio process on 16 GB GPUs.
+The API sends sampled video frames to vLLM as individual images, so the engine
+also reserves one image input and no native-video input per prompt.
 
 What it does, in order:
 
@@ -87,11 +94,15 @@ What it does, in order:
    the most **free** VRAM (`--gpu-index N` to pin one). Validated for:
    | GPU | VRAM | engine setting chosen |
    |---|---|---|
-   | NVIDIA RTX A4000 | 16 GB | `VLLM_GPU_MEMORY_UTILIZATION=0.80` |
+   | NVIDIA RTX A4000 | 16 GB | `VLLM_GPU_MEMORY_UTILIZATION=0.92` |
    | NVIDIA RTX PRO 4000 Blackwell | 24 GB | `0.80` |
    | NVIDIA RTX A6000 | 48 GB | `0.85` |
    Any other NVIDIA card works: utilisation is derived from free VRAM and the
    engine dtype is `auto` (bf16 on Ampere+, float16 fallback on older cards).
+   On a 16 GB card the engine owns the whole GPU (weights 7.37 GiB, profile peak
+   ~13.75 GiB, 0.60 GiB of KV cache), so the audio stack the API loads on the
+   same GPU is released before the entrypoint supervisor restarts a crashed
+   engine - see `engine_power.sleep_now()`.
    If another container (e.g. ollama) holds VRAM, the deploy stops and says so
    instead of deploying a service that cannot load its engine.
 3. **Image check** — confirms `activity-recognition:2.0.0` is loaded.

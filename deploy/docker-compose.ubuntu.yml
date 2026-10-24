@@ -1,16 +1,25 @@
-# Ubuntu/Linux override for the activity-recognition service.
-#
-# Usage (from the project root on the Ubuntu host):
-#   cp ubuntu/.env.ubuntu .env
-#   docker compose -f docker-compose.yml -f ubuntu/docker-compose.ubuntu.yml up -d
-#
-# Why an override:
-#  - The Ubuntu host loads the image transferred from the Windows build host
-#    (activity-recognition:2.0.0 with all model weights baked in: Qwen3-VL-8B
-#    AWQ, Qwen2.5-Omni-3B and faster-whisper large-v3). No build is needed
-#    and the stack runs fully offline.
-#  - The main compose file stays untouched and remains valid for the Windows host.
+# Ubuntu/Linux override. An empty Hugging Face volume would hide models baked
+# into the offline image, so the Linux mount list deliberately omits it.
 services:
   activity-recognition:
     image: activity-recognition:2.0.0
-    build: !reset null
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      VLLM_MODEL_ID: /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit
+      VLLM_VISION_MODEL: /app/hf_models/Qwen3-VL-8B-Instruct-AWQ-4bit
+      QWEN_AUDIO_MODEL_ID: /app/hf_models/Qwen2.5-Omni-3B
+      WHISPER_MODEL_ID: /app/whisper_models/faster-whisper-large-v3
+      WHISPER_DOWNLOAD_ROOT: /app/whisper_models
+      OBJECT_MODEL_PATH: /app/object_detect_model_256_class.pt
+      REPORTS_HOST_PATH: /app/reports
+    volumes: !override
+      - ./reports:/app/reports
+      - ./config:/app/config
+      - activity-data:/app/data
+      - ${TEST_VIDEOS_DIR:-./testvideos}:/testvideos:ro
+      - ./secrets:/app/secrets:ro

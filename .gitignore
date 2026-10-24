@@ -1,39 +1,64 @@
-# Model weights and cached checkpoints (22 GB; restored from the build host/volume)
-hf_models/
-whisper_models/
-*.pt
-*.safetensors
-*.bin
-
-# Runtime state and secrets
+# --- Environment / secrets ---
 .env
+.env.*
+!.env.example
 secrets/*
 !secrets/.gitkeep
 config/runtime.json
-data/
+
+# --- Model weights and cached checkpoints (22 GB; restored from the build host/volume) ---
+hf_models/*
+!hf_models/.gitkeep
+whisper_models/*
+!whisper_models/.gitkeep
+*.pt
+*.bin
+*.safetensors
+*.gguf
+
+# --- Media fixtures and generated artefacts ---
+testvideos/
+final-guard-videos/
 reports/
 logs/
-testvideos/
-*.sqlite3
-*.sqlite3-*
-*.pid
-*.exit
+data/
+*.log
+build-ubuntu.log
+*.mp4
+*.tar
+*.tar.gz
 
-# Generated evaluation and guard artefacts
+# --- Generated evaluation and guard artefacts ---
 activity-evaluation*
 audio-worker-check*
 consecutive-check*
 final-guard*
 joint-guard-check*
 rubric-check*
-build-ubuntu.log
-*.tar
-*.tar.gz
-*.mp4
+/*.csv
+/*.json
+*.pid
+*.exit
 
-# Python / tooling
+# --- Python / tooling ---
 __pycache__/
 *.py[cod]
 .venv/
 .pytest_cache/
 .mypy_cache/
+*.sqlite3
+*.sqlite3-*
+
+# --- Editor / OS / backup noise ---
+*.bak
+*.bak-*
+*.backup
+*.orig
+*~
+.DS_Store
+.vscode/
+.idea/
+Dockerfile.backup
+Dockerfile.pre-codex-fix
+docker-compose.linux.yml
+UPDATED_OFFLINE_FILES.md
